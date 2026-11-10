@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 # Python
 __pycache__/
 *.py[cod]
@@ -11,3 +12,54 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+=======
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.bak
+
+# Local database files
+*.db
+*.sqlite3
+>>>>>>> Stashed changes
