@@ -1,0 +1,5 @@
+cohere>=5.0.0
+pydantic>=2.0.0
+
+# Optional: only needed if you load COHERE_API_KEY from a .env file
+# python-dotenv>=1.0.0
