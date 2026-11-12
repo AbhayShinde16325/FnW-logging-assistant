@@ -13,3 +13,9 @@
 - Use parameterized SQL; never inline untrusted input.
 - Ask a clarification question instead of guessing when a request is ambiguous.
 - Prefer the shared execution layer `database.sql_execution` when available; it enforces the same confirmation rules in code.
+
+## Date/time handling
+- Use `datetime_resolver.resolve(text, now=..., timezone=...)` for natural-language dates and times.
+- Do not duplicate relative-date parsing.
+- Do not substitute `CURRENT_DATE` for a missing or unstated date.
+- In tests, pass a fixed `now` and timezone for deterministic results.
