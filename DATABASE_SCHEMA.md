@@ -6,20 +6,26 @@ Source of truth: `database/models.py`, `database/connection.py`,
 
 ## Guardrails (MUST follow)
 
-These guardrails are non-negotiable and apply to every generated query.
+These guardrails are non-negotiable and apply to every generated or executed
+statement.
 
-- The LM may only generate SQL for **read (SELECT)**, **create (INSERT)**, and
-  **update (UPDATE)** operations.
-- The LM MUST NOT generate, suggest, or execute **delete operations** —
-  including `DELETE`, `TRUNCATE`, `DROP`, or any other destructive statement.
-- If a user asks to delete data, refuse the SQL generation and respond that
-  delete operations are not permitted. Do not provide a workaround query.
 - Only the `tasks` table may be referenced. No other tables, no joins, no
   schema changes (`ALTER`, `CREATE TABLE`, etc.).
-- Every `UPDATE` MUST include a `WHERE` clause; never generate a query that
-  updates all rows unconditionally.
-- This reference and the rules below apply only to `SELECT`, `INSERT`, and
-  `UPDATE`.
+- Allowed operations are `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and
+  `DROP TABLE tasks`.
+- `SELECT` and `INSERT` require no confirmation.
+- `UPDATE`, `DELETE`, and `DROP TABLE tasks` require explicit user confirmation
+  before execution.
+- Before confirmation, show the exact SQL, parameters, target rows/table, and
+  explain the impact.
+- `DELETE` must include a specific `WHERE` clause; never allow an unrestricted
+  `DELETE`.
+- `DROP TABLE tasks` must identify the exact table and clearly warn that the
+  entire table and all rows will be removed.
+- Never treat general conversation or ambiguous responses as confirmation.
+- `TRUNCATE`, `ALTER`, `CREATE DATABASE`, and unrelated operations are
+  prohibited.
+- Use parameterized values; never inline untrusted input.
 
 ## Connection
 
@@ -69,12 +75,13 @@ Mapped class: `database.models.Task`.
 3. Prefer explicit column lists over `SELECT *` in generated SQL.
 4. For natural-language answers, add `ORDER BY` so results are deterministic
    (default: `ORDER BY id`).
-5. Use parameter placeholders (`$1`, `$2`, ... for psycopg) instead of string
-   interpolation when generating queries that take user values. Never inline
-   untrusted input.
-6. Read requests -> `SELECT`. Write requests -> `INSERT` / `UPDATE` only.
-   `DELETE` is not permitted (see Guardrails). For `UPDATE` always include a
-   `WHERE` clause.
+5. Use parameter placeholders supported by the executor (`$1`, `$2`, ... for
+   psycopg, or `:name` for SQLAlchemy) instead of string interpolation when
+   generating queries that take user values. Never inline untrusted input.
+6. Read requests -> `SELECT`. Write requests -> `INSERT`, `UPDATE`, `DELETE`,
+   or `DROP TABLE tasks` per the Guardrails. `UPDATE` and `DELETE` always
+   include a `WHERE` clause. Destructive operations require explicit
+   confirmation before execution.
 7. Date/time output should use `to_char(<date_column>, 'YYYY-MM-DD')` and
    `to_char(<time_column>, 'HH24:MI')` when formatting for display, applying
    this to assigned, deadline, and reminder date/time columns.
@@ -184,8 +191,19 @@ WHERE id = $3
 RETURNING id, task_title, status, progress;
 ```
 
-Delete by id: **PROHIBITED — do not generate.** The LM must not produce
-`DELETE` (or `TRUNCATE`/`DROP`) statements. Refuse delete requests instead.
+Delete by id (requires confirmation):
+
+```sql
+DELETE FROM tasks
+WHERE id = $1
+RETURNING id, task_title, assigned_to, status, progress;
+```
+
+Drop table (requires confirmation and an explicit warning):
+
+```sql
+DROP TABLE tasks;
+```
 
 ## Answering from results
 
