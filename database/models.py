@@ -20,6 +20,10 @@ class Task(Base):
 
     deadline_time = Column(Time, nullable=True)
 
+    reminder_date = Column(Date, nullable=True)
+
+    reminder_time = Column(Time, nullable=True)
+
     status = Column(String, default="PENDING")
 
     progress = Column(Integer, default=0)

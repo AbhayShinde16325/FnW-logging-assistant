@@ -21,7 +21,11 @@ from voice.speech_to_text import (
     VoiceInputError
 )
 
-from services.task_service import process_task
+from services.task_service import (
+    process_task,
+    process_chat_turn,
+    process_voice_turn,
+)
 
 
 # Logging configuration
@@ -81,6 +85,17 @@ class TaskRequest(BaseModel):
     confirm: bool = False
 
 
+class ChatRequest(BaseModel):
+    """One turn of the live, two-way task conversation."""
+
+    message: str
+    stage: str | None = None
+    draft: dict | None = None
+    answers: dict | None = None
+    reminder_text: str | None = None
+    confirm: bool = False
+
+
 # Health check
 @app.get("/health")
 def health_check():
@@ -133,8 +148,87 @@ def handle_text(request: TaskRequest):
         )
 
 
-# VOICE INPUT ENDPOINT
+# CONVERSATIONAL CHAT ENDPOINT
+@app.post("/tasks/chat")
+def handle_chat(request: ChatRequest):
+
+    try:
+
+        logger.info("Received chat conversation turn.")
+
+        result = process_chat_turn(
+            user_input=request.message,
+            stage=request.stage,
+            draft=request.draft,
+            answers=request.answers,
+            reminder_text=request.reminder_text,
+            confirm=request.confirm,
+        )
+
+        logger.info("Chat conversation turn processed.")
+
+        return jsonable_encoder(result)
+
+    except ValueError as error:
+
+        logger.warning("Chat validation error: %s", error)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception:
+
+        logger.exception("Chat turn processing failed.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Internal chat processing error."
+        )
+
+
+def _parse_voice_state(state_json: str | None) -> dict:
+    """Decode the stateless conversation state sent by the frontend."""
+
+    if not state_json:
+        return {}
+
+    try:
+        state = json.loads(state_json)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid state JSON."
+        )
+
+    if not isinstance(state, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="State must be a JSON object."
+        )
+
+    return state
+
+
+def _reply_for_result(result) -> str:
+    """Human-readable reply for the next turn of the conversation."""
+
+    if not isinstance(result, dict):
+        return ""
+
+    if result.get("reply"):
+        return result["reply"]
+
+    if result.get("status") == "success":
+        return result.get("message") or "Done."
+
+    return result.get("question") or result.get("message") or ""
+
+
+# VOICE INPUT ENDPOINT (single turn + conversation continuation)
 @app.post("/tasks/voice")
+@app.post("/tasks/voice/turn")
 def handle_voice(
     file: UploadFile = File(...),
     task_id: int | None = Form(None),
@@ -175,41 +269,36 @@ def handle_voice(
         logger.info("Transcript: %s", transcription.text)
         logger.info("Detected language: %s", transcription.language)
 
-        # Step 3: Process transcript using AI Task Service
+        # Step 3: Restore the stateless conversation state, then process the
+        # transcript with the AI task engine.
         logger.info("Sending transcript to Task Service...")
 
-        # Continuation state for the staged CREATE flow (voice follow-ups
-        # travel as a JSON string in the `state` form field).
-        state: dict = {}
-        if state_json:
-            try:
-                state = json.loads(state_json)
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid state JSON."
-                )
+        voice_state = _parse_voice_state(state)
 
-        result = process_task(
-            user_input=transcription.text,
+        result = process_voice_turn(
+            transcription.text,
             task_id=task_id,
             confirm_delete=confirm_delete,
-            stage=stage or state.get("stage"),
-            draft=state.get("draft"),
-            answers=state.get("answers"),
-            reminder_text=reminder_text or state.get("reminder_text"),
-            confirm=confirm or bool(state.get("confirm")),
+            stage=stage or voice_state.get("stage"),
+            draft=voice_state.get("draft"),
+            answers=voice_state.get("answers"),
+            reminder_text=reminder_text or voice_state.get("reminder_text"),
+            confirm=confirm or bool(voice_state.get("confirm")),
         )
 
         logger.info("Voice task processing completed.")
 
-        # Step 4: Return response
+        encoded_result = jsonable_encoder(result)
+
+        # Step 4: Return transcript + AI reply so the frontend can continue
+        # the two-way conversation.
         return {
             "transcription": transcription.text,
             "language": transcription.language,
             "confidence": transcription.language_probability,
             "duration": transcription.duration_seconds,
-            "result": jsonable_encoder(result)
+            "reply": _reply_for_result(encoded_result),
+            "result": encoded_result
         }
 
     except HTTPException:

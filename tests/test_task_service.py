@@ -209,3 +209,67 @@ def test_update_flow_unchanged(client, staged_service, monkeypatch):
     body = response.json()
     assert body["status"] == "success"
     assert body["task"]["progress"] == 80
+
+
+def test_chat_asks_one_field_at_a_time_and_updates_draft(client, staged_service):
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "Rahul has a Python API research task",
+            "stage": "start",
+        },
+    )
+    assert response.status_code == 200
+
+    first = response.json()
+    assert first["status"] == "clarification_required"
+    assert first["missing_fields"] == ["status"]
+    assert "status" in first["reply"].lower()
+    assert first["draft"]["task_title"] == "Python API research"
+
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "it is in progress",
+            "stage": first["stage"],
+            "draft": first["draft"],
+        },
+    )
+    second = response.json()
+    assert second["status"] == "confirmation_required"
+    assert second["draft"]["status"] == "IN_PROGRESS"
+
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "yes",
+            "stage": second["stage"],
+            "draft": second["draft"],
+        },
+    )
+    third = response.json()
+    assert third["status"] == "reminder_required"
+
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "30 minutes before the deadline",
+            "stage": third["stage"],
+            "draft": third["draft"],
+        },
+    )
+    fourth = response.json()
+    assert fourth["status"] == "reminder_confirmation_required"
+    assert fourth["reminder"]["time"] == "16:30"
+
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "yes",
+            "stage": fourth["stage"],
+            "draft": fourth["draft"],
+        },
+    )
+    final = response.json()
+    assert final["status"] == "success"
+    assert final["reply"] == "Task created successfully."

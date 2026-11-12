@@ -67,6 +67,27 @@ DEFAULT_REMINDER_QUESTION = (
     "the deadline')."
 )
 
+STATUS_PHRASES = {
+    "pending": "PENDING",
+    "not started": "PENDING",
+    "not_started": "PENDING",
+    "todo": "PENDING",
+    "in progress": "IN_PROGRESS",
+    "in_progress": "IN_PROGRESS",
+    "ongoing": "IN_PROGRESS",
+    "working on it": "IN_PROGRESS",
+    "completed": "COMPLETED",
+    "complete": "COMPLETED",
+    "done": "COMPLETED",
+    "finished": "COMPLETED",
+}
+
+NUMBER_WORDS = {
+    "zero": 0, "ten": 10, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100,
+}
+
 
 def _to_date(value: str) -> date:
     return date.fromisoformat(value)
@@ -162,6 +183,56 @@ class TaskDraftEngine:
 
         return self._next_step(draft, errors=errors)
 
+    def answer(self, draft: dict, user_input: str) -> StepResult:
+        """Interpret one conversational reply and fill the missing fields.
+
+        The reply is passed through the same extractor used for the initial
+        message, so the user can answer naturally ("it's due next Friday at
+        5 pm", "Rahul", "50 percent done") instead of filling a form.
+        """
+
+        draft = dict(draft or {})
+        target = self._first_missing(draft)
+
+        extraction = self.extractor.extract_draft(user_input)
+        answers = self._extraction_answers(
+            extraction, draft, target=target
+        )
+
+        if target is not None and target not in answers:
+            # If the reply clearly answers a different date field (for
+            # example the user volunteers the deadline while we asked for the
+            # assigned date), keep that value and re-ask the original field
+            # instead of storing unrelated text in the wrong field.
+            conflicts = self._conflicts_with_target(target, user_input)
+
+            if not (answers and conflicts):
+                value = self._fallback_answer(target, user_input, extraction)
+                if value is not None:
+                    answers[target] = value
+
+        return self.apply(draft, answers)
+
+    def edit(self, draft: dict, user_input: str) -> StepResult:
+        """Apply a natural-language correction at the confirmation stage."""
+
+        draft = dict(draft or {})
+        extraction = self.extractor.extract_draft(user_input)
+        answers = self._extraction_answers(
+            extraction, draft, include_existing=True
+        )
+
+        if not answers:
+            return self._next_step(
+                draft,
+                errors=[
+                    "I couldn't find a field to update. Tell me the field and "
+                    "its new value, for example 'progress is 80 percent'."
+                ],
+            )
+
+        return self.apply(draft, answers)
+
     def confirm_fields(self, draft: dict, confirm: bool) -> StepResult:
         draft = dict(draft or {})
 
@@ -243,6 +314,131 @@ class TaskDraftEngine:
         draft["reminder_date"] = None
         draft["reminder_time"] = None
         return draft
+
+    @staticmethod
+    def _first_missing(draft: dict) -> str | None:
+        for name in FIELD_ORDER:
+            if draft.get(name) is None:
+                return name
+        return None
+
+    def _extraction_answers(
+        self,
+        extraction,
+        draft: dict,
+        target: str | None = None,
+        include_existing: bool = False,
+    ) -> dict:
+        """Turn an extraction into {field: value} answers.
+
+        When filling a single missing field we only take newly missing fields
+        from the reply, so an earlier answer is never overwritten by chance.
+        """
+
+        def wants(name: str) -> bool:
+            if include_existing:
+                return True
+            return name == target or draft.get(name) is None
+
+        answers: dict[str, object] = {}
+
+        if extraction.task_title and wants("task_title"):
+            answers["task_title"] = extraction.task_title.strip()
+
+        if extraction.assigned_to and wants("assigned_to"):
+            answers["assigned_to"] = extraction.assigned_to.strip()
+
+        if extraction.status and wants("status"):
+            answers["status"] = extraction.status
+
+        if extraction.progress is not None and wants("progress"):
+            answers["progress"] = extraction.progress
+
+        for kind in ("assigned", "deadline"):
+            phrase = getattr(extraction, f"{kind}_when", None)
+            if not phrase:
+                continue
+
+            resolved_date, resolved_time, _ = self._resolve_phrase(phrase)
+
+            if resolved_date and wants(f"{kind}_date"):
+                answers[f"{kind}_date"] = resolved_date.isoformat()
+
+            if resolved_time and wants(f"{kind}_time"):
+                answers[f"{kind}_time"] = resolved_time.strftime("%H:%M")
+
+        return answers
+
+    @staticmethod
+    def _conflicts_with_target(name: str, user_input: str) -> bool:
+        if name not in DATE_FIELDS and name not in TIME_FIELDS:
+            return False
+
+        lowered = (user_input or "").lower()
+
+        if name.startswith("deadline"):
+            return "assigned" in lowered or "assign " in lowered
+
+        return "deadline" in lowered or "due " in lowered
+
+    def _fallback_answer(self, name: str, user_input: str, extraction):
+        """Map a bare reply to the field the assistant just asked about."""
+
+        text = (user_input or "").strip()
+
+        if name in TEXT_FIELDS:
+            value = getattr(extraction, name, None)
+            return value.strip() if value else text or None
+
+        if name == "status":
+            return extraction.status or self._status_from_text(text)
+
+        if name == "progress":
+            if extraction.progress is not None:
+                return extraction.progress
+            return self._progress_from_text(text)
+
+        if name in DATE_FIELDS or name in TIME_FIELDS:
+            return text or None
+
+        return text or None
+
+    @staticmethod
+    def _status_from_text(text: str) -> str | None:
+        normalized = " ".join((text or "").lower().replace(",", " ").split())
+
+        for phrase, status in STATUS_PHRASES.items():
+            if phrase in normalized:
+                return status
+
+        upper = normalized.replace(" ", "_").upper()
+        if upper in STATUS_VALUES:
+            return upper
+
+        return None
+
+    @staticmethod
+    def _progress_from_text(text: str) -> int | None:
+        cleaned = (text or "").strip()
+
+        if re.fullmatch(r"\d{1,3}\s*%?", cleaned):
+            value = int(re.sub(r"\D", "", cleaned))
+            if 0 <= value <= 100:
+                return value
+
+        match = re.search(r"(\d{1,3})\s*(?:%|percent|pct|per cent)", cleaned.lower())
+        if match:
+            value = int(match.group(1))
+            if 0 <= value <= 100:
+                return value
+
+        normalized = cleaned.lower()
+        if "percent" in normalized or "%" in normalized:
+            for word, value in NUMBER_WORDS.items():
+                if re.search(rf"\b{word}\b", normalized):
+                    return value
+
+        return None
 
     def _resolve_phrase(self, phrase: str):
         result = resolve(phrase, now=self._now(), timezone=self.timezone)

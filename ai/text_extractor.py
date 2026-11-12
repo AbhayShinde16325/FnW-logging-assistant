@@ -84,8 +84,8 @@ class ExtractionResult(BaseModel):
 class TaskRecord(TaskDetails):
     """Final, fully-confirmed task: the 8 stored fields + the reminder.
 
-    reminder_date / reminder_time have no database columns yet; the
-    repository ignores them until the migration adds them.
+    reminder_date / reminder_time map to the reminder columns on the Task
+    model and are persisted by the repository.
     """
 
     reminder_date: date | None = None

@@ -5,6 +5,8 @@ sqlalchemy
 psycopg[binary]
 fastapi
 uvicorn
+python-multipart
+faster-whisper
 tzdata
 pytest
 httpx

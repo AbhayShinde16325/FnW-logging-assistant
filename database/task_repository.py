@@ -13,9 +13,8 @@ def create_task(task_details):
         else:
             task_data = dict(task_details)
 
-        # Ignore keys that have no matching column yet (e.g. reminder_date /
-        # reminder_time until the database migration adds them). This keeps
-        # TaskRecord forward-compatible with the current schema.
+        # Ignore keys that have no matching column so the caller can pass
+        # forward-compatible data without breaking the insert.
         task_data = {
             key: value
             for key, value in task_data.items()
