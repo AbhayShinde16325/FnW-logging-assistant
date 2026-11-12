@@ -1,160 +1,215 @@
 
-from ai.text_extractor import TaskExtractor
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
 
 from database.connection import create_tables
-from database.task_repository import (
-    create_task,
-    update_task,
-    delete_task,
-    get_all_tasks
+
+from voice.speech_to_text import (
+    transcribe_audio,
+    VoiceInputError
+)
+
+from services.task_service import process_task
+
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Application startup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    logger.info("Initializing application...")
+
+    create_tables()
+
+    logger.info("Database initialized successfully.")
+
+    yield
+
+    logger.info("Application shutting down.")
+
+
+app = FastAPI(
+    title="Task Flow Automation API",
+    description="AI-powered task management using voice and text.",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 
-# Create database tables
-create_tables()
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173"
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def detect_operation(user_input):
-    """
-    Detect whether the user wants to CREATE, UPDATE or DELETE.
-    """
+# Request schema
+class TaskRequest(BaseModel):
 
-    text = user_input.lower()
-
-    delete_keywords = [
-        "delete",
-        "remove",
-        "erase",
-        "cancel task",
-        "discard task"
-    ]
-
-    update_keywords = [
-        "update",
-        "modify",
-        "change",
-        "revise",
-        "increase progress",
-        "decrease progress",
-        "mark as completed"
-    ]
-
-    if any(keyword in text for keyword in delete_keywords):
-        return "DELETE"
-
-    if any(keyword in text for keyword in update_keywords):
-        return "UPDATE"
-
-    return "CREATE"
+    text: str
+    task_id: int | None = None
+    confirm_delete: bool = False
 
 
-def display_task(task):
+# Health check
+@app.get("/health")
+def health_check():
 
-    print("\nTASK DETAILS")
-    print("-" * 40)
-
-    print({
-        "id": task.id,
-        "task_title": task.task_title,
-        "assigned_to": task.assigned_to,
-        "assigned_date": str(task.assigned_date),
-        "assigned_time": str(task.assigned_time),
-        "deadline_date": str(task.deadline_date),
-        "deadline_time": str(task.deadline_time),
-        "status": task.status,
-        "progress": task.progress
-    })
+    return {
+        "status": "healthy",
+        "message": "Task Flow Automation API is running."
+    }
 
 
-def main():
-
-    extractor = TaskExtractor()
-
-    user_input = input("\nEnter your task description: ")
+# TEXT INPUT ENDPOINT
+@app.post("/tasks/text")
+def handle_text(request: TaskRequest):
 
     try:
 
-        # Step 1: Detect operation
-        operation = detect_operation(user_input)
+        logger.info("Received text task request.")
 
-        print("\nDetected operation:", operation)
+        result = process_task(
+            user_input=request.text,
+            task_id=request.task_id,
+            confirm_delete=request.confirm_delete
+        )
 
-        # Step 2: Retrieve existing tasks
-        if operation in ["UPDATE", "DELETE"]:
+        logger.info("Text task processing completed.")
 
-            existing_tasks = get_all_tasks()
-
-            if not existing_tasks:
-                print("No existing tasks found.")
-                return
-
-            print("\nExisting tasks:")
-
-            for task in existing_tasks:
-                print(
-                    f"ID: {task.id} | "
-                    f"Title: {task.task_title} | "
-                    f"Assigned to: {task.assigned_to} | "
-                    f"Progress: {task.progress}%"
-                )
-
-            task_id = int(input("\nEnter the task ID: "))
-
-            # Step 3: DELETE operation
-            if operation == "DELETE":
-
-                confirmation = input(
-                    f"Are you sure you want to delete task {task_id}? (yes/no): "
-                ).lower()
-
-                if confirmation != "yes":
-                    print("Task deletion cancelled.")
-                    return
-
-                deleted = delete_task(task_id)
-
-                if deleted:
-                    print("\nTASK DELETED SUCCESSFULLY")
-                else:
-                    print("\nTask not found.")
-
-                return
-
-        # Step 4: Extract task details
-        task_details = extractor.extract_task(user_input)
-
-        print("\nAI EXTRACTED DATA:")
-        print(task_details.model_dump(mode="json"))
-
-        # Step 5: CREATE operation
-        if operation == "CREATE":
-
-            saved_task = create_task(task_details)
-
-            print("\nNEW TASK CREATED SUCCESSFULLY")
-
-            display_task(saved_task)
-
-        # Step 6: UPDATE operation
-        elif operation == "UPDATE":
-
-            updated_task = update_task(
-                task_id,
-                task_details.model_dump()
-            )
-
-            if updated_task:
-                print("\nTASK UPDATED SUCCESSFULLY")
-                display_task(updated_task)
-            else:
-                print("\nTask not found.")
+        return jsonable_encoder(result)
 
     except ValueError as error:
-        print("Validation error:", error)
 
-    except Exception as error:
-        print("Application error:", error)
+        logger.warning("Text validation error: %s", error)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception:
+
+        logger.exception("Text task processing failed.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Internal task processing error."
+        )
 
 
-if __name__ == "__main__":
-    main()
+# VOICE INPUT ENDPOINT
+@app.post("/tasks/voice")
+def handle_voice(
+    file: UploadFile = File(...),
+    task_id: int | None = Form(None),
+    confirm_delete: bool = Form(False)
+):
+
+    try:
+
+        logger.info("Received voice input: %s", file.filename)
+
+        # Step 1: Read uploaded audio
+        audio_bytes = file.file.read()
+
+        if not audio_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded audio is empty."
+            )
+
+        logger.info(
+            "Audio received successfully: %s bytes",
+            len(audio_bytes)
+        )
+
+        # Step 2: Speech-to-text using Faster-Whisper
+        logger.info("Starting Faster-Whisper transcription...")
+
+        transcription = transcribe_audio(
+            audio_bytes,
+            filename=file.filename
+        )
+
+        logger.info("Transcription completed successfully.")
+        logger.info("Transcript: %s", transcription.text)
+        logger.info("Detected language: %s", transcription.language)
+
+        # Step 3: Process transcript using AI Task Service
+        logger.info("Sending transcript to Task Service...")
+
+        result = process_task(
+            user_input=transcription.text,
+            task_id=task_id,
+            confirm_delete=confirm_delete
+        )
+
+        logger.info("Voice task processing completed.")
+
+        # Step 4: Return response
+        return {
+            "transcription": transcription.text,
+            "language": transcription.language,
+            "confidence": transcription.language_probability,
+            "duration": transcription.duration_seconds,
+            "result": jsonable_encoder(result)
+        }
+
+    except HTTPException:
+        raise
+
+    except VoiceInputError as error:
+
+        logger.warning("Voice input error: %s", error)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except ValueError as error:
+
+        logger.warning("Validation error: %s", error)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception:
+
+        logger.exception("Voice processing failed.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Internal voice processing error."
+        )
+
+    finally:
+
+        file.file.close()

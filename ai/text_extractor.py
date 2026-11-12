@@ -20,7 +20,7 @@ client = cohere.ClientV2(api_key=os.environ["COHERE_API_KEY"])
 
 
 class TaskDetails(BaseModel):
-    task_title: str = Field(min_length=1)
+    task_title: str | None = Field(default=None, min_length=1)
     assigned_to: str | None = None
     assigned_date: date | None = None
     assigned_time: time | None = None
