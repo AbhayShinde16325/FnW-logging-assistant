@@ -1,4 +1,4 @@
-
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -73,6 +73,12 @@ class TaskRequest(BaseModel):
     text: str
     task_id: int | None = None
     confirm_delete: bool = False
+    # Staged CREATE flow (stateless echo: the draft travels with the request)
+    stage: str | None = None
+    draft: dict | None = None
+    answers: dict | None = None
+    reminder_text: str | None = None
+    confirm: bool = False
 
 
 # Health check
@@ -96,7 +102,12 @@ def handle_text(request: TaskRequest):
         result = process_task(
             user_input=request.text,
             task_id=request.task_id,
-            confirm_delete=request.confirm_delete
+            confirm_delete=request.confirm_delete,
+            stage=request.stage,
+            draft=request.draft,
+            answers=request.answers,
+            reminder_text=request.reminder_text,
+            confirm=request.confirm,
         )
 
         logger.info("Text task processing completed.")
@@ -127,7 +138,11 @@ def handle_text(request: TaskRequest):
 def handle_voice(
     file: UploadFile = File(...),
     task_id: int | None = Form(None),
-    confirm_delete: bool = Form(False)
+    confirm_delete: bool = Form(False),
+    stage: str | None = Form(None),
+    reminder_text: str | None = Form(None),
+    confirm: bool = Form(False),
+    state: str | None = Form(None),
 ):
 
     try:
@@ -163,10 +178,27 @@ def handle_voice(
         # Step 3: Process transcript using AI Task Service
         logger.info("Sending transcript to Task Service...")
 
+        # Continuation state for the staged CREATE flow (voice follow-ups
+        # travel as a JSON string in the `state` form field).
+        state: dict = {}
+        if state_json:
+            try:
+                state = json.loads(state_json)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid state JSON."
+                )
+
         result = process_task(
             user_input=transcription.text,
             task_id=task_id,
-            confirm_delete=confirm_delete
+            confirm_delete=confirm_delete,
+            stage=stage or state.get("stage"),
+            draft=state.get("draft"),
+            answers=state.get("answers"),
+            reminder_text=reminder_text or state.get("reminder_text"),
+            confirm=confirm or bool(state.get("confirm")),
         )
 
         logger.info("Voice task processing completed.")

@@ -11,7 +11,16 @@ def create_task(task_details):
         if hasattr(task_details, "model_dump"):
             task_data = task_details.model_dump()
         else:
-            task_data = task_details
+            task_data = dict(task_details)
+
+        # Ignore keys that have no matching column yet (e.g. reminder_date /
+        # reminder_time until the database migration adds them). This keeps
+        # TaskRecord forward-compatible with the current schema.
+        task_data = {
+            key: value
+            for key, value in task_data.items()
+            if hasattr(Task, key) and key != "id"
+        }
 
         task = Task(**task_data)
 

@@ -46,6 +46,52 @@ class TaskDetails(BaseModel):
         return value
 
 
+class ExtractionResult(BaseModel):
+    """Raw extraction used by the interactive draft flow.
+
+    Date/time values are returned VERBATIM as phrases; the deterministic
+    `datetime_resolver` converts them later. Never stored directly.
+    """
+
+    task_title: str | None = None
+    assigned_to: str | None = None
+    assigned_when: str | None = None
+    deadline_when: str | None = None
+    reminder_when: str | None = None
+    status: str | None = None
+    progress: int | None = Field(default=None, ge=0, le=100)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value):
+        if value is None:
+            return None
+
+        allowed_statuses = {
+            "PENDING",
+            "IN_PROGRESS",
+            "COMPLETED"
+        }
+
+        value = value.upper()
+
+        if value not in allowed_statuses:
+            raise ValueError("Invalid task status.")
+
+        return value
+
+
+class TaskRecord(TaskDetails):
+    """Final, fully-confirmed task: the 8 stored fields + the reminder.
+
+    reminder_date / reminder_time have no database columns yet; the
+    repository ignores them until the migration adds them.
+    """
+
+    reminder_date: date | None = None
+    reminder_time: time | None = None
+
+
 def validate_business_rules(task):
     if task.status == "COMPLETED" and task.progress != 100:
         raise ValueError(
@@ -145,6 +191,104 @@ class TaskExtractor:
                 validate_business_rules(task)
 
                 return task
+
+            except TooManyRequestsError as error:
+                if attempt >= MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Cohere API error: {error}"
+                    ) from error
+
+                print(
+                    f"Rate limited by Cohere. Retrying in 60 seconds... "
+                    f"(attempt {attempt}/{MAX_ATTEMPTS})"
+                )
+                sleep(60)
+
+            except ApiError as error:
+                raise RuntimeError(
+                    f"Cohere API error: {error}"
+                ) from error
+
+            except (
+                json.JSONDecodeError,
+                KeyError,
+                IndexError,
+                TypeError,
+                ValidationError
+            ) as error:
+                last_error = error
+
+                if attempt >= MAX_ATTEMPTS:
+                    preview = (raw_output or "")[:300]
+                    raise RuntimeError(
+                        f"Invalid response from the AI model after "
+                        f"{MAX_ATTEMPTS} attempts: {error}. "
+                        f"Raw model output: {preview!r}"
+                    ) from error
+
+                # Otherwise loop once more and retry the same input.
+
+    def extract_draft(self, user_input):
+        """
+        Like extract_task(), but returns raw date/time phrases (assigned_when,
+        deadline_when, reminder_when) instead of concrete values, so the
+        deterministic datetime_resolver can interpret them later.
+        """
+        system_prompt = """
+        You are a task information extraction assistant.
+
+        Extract task information from the user's input as RAW references.
+
+        Return ONLY valid JSON with these fields:
+        {
+            "task_title": "string or null",
+            "assigned_to": "name or null",
+            "assigned_when": "verbatim date/time phrase about when the task was assigned, or null",
+            "deadline_when": "verbatim date/time phrase about the deadline, or null",
+            "reminder_when": "verbatim phrase about a reminder (e.g. '30 mins before the deadline'), or null",
+            "status": "PENDING, IN_PROGRESS, COMPLETED, or null",
+            "progress": "integer or null"
+        }
+
+        Rules:
+        1. Copy date/time phrases VERBATIM from the input (e.g. "tomorrow at 5", "15 November 2026 at 5 PM"). Never convert them into dates or times.
+        2. If a phrase or value is missing, return null.
+        3. Do not invent information. Do not use today's date.
+        4. assigned_to is the person the task is assigned to, or null.
+        5. progress is only the stated percentage, or null.
+        6. Understand English and Hinglish.
+        7. Return exactly one JSON object, with no text, Markdown, or extra objects before or after it.
+        """
+
+        last_error = None
+        raw_output = None
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = client.chat(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_input}
+                    ],
+                    response_format={"type": "json_object"},
+                    thinking={"type": "disabled"},
+                    temperature=0,
+                )
+
+                text_segments = [
+                    item
+                    for item in response.message.content
+                    if getattr(item, "type", None) == "text"
+                ]
+
+                if not text_segments:
+                    raise IndexError("The model returned no text content.")
+
+                raw_output = text_segments[0].text
+
+                extracted_data = parse_llm_json(raw_output)
+                return ExtractionResult.model_validate(extracted_data)
 
             except TooManyRequestsError as error:
                 if attempt >= MAX_ATTEMPTS:
