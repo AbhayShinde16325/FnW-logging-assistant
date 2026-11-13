@@ -1,22 +1,18 @@
-import os
 import json
 from time import sleep
 
-import cohere
-from cohere import TooManyRequestsError
-from cohere.core import ApiError
-from dotenv import load_dotenv
-
-load_dotenv()
+import config
+from ai.llm_client import (
+    ProviderError,
+    RateLimitedError,
+    chat_json,
+)
 
 from datetime import date, time
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
-MODEL_NAME = "command-a-plus-05-2026"
 MAX_ATTEMPTS = 2
-
-client = cohere.ClientV2(api_key=os.environ["COHERE_API_KEY"])
 
 
 class TaskDetails(BaseModel):
@@ -163,27 +159,7 @@ class TaskExtractor:
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = client.chat(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_input}
-                    ],
-                    response_format={"type": "json_object"},
-                    thinking={"type": "disabled"},
-                    temperature=0,
-                )
-
-                text_segments = [
-                    item
-                    for item in response.message.content
-                    if getattr(item, "type", None) == "text"
-                ]
-
-                if not text_segments:
-                    raise IndexError("The model returned no text content.")
-
-                raw_output = text_segments[0].text
+                raw_output = chat_json(system_prompt, user_input)
 
                 extracted_data = parse_llm_json(raw_output)
                 task = TaskDetails.model_validate(extracted_data)
@@ -192,21 +168,22 @@ class TaskExtractor:
 
                 return task
 
-            except TooManyRequestsError as error:
+            except RateLimitedError:
                 if attempt >= MAX_ATTEMPTS:
                     raise RuntimeError(
-                        f"Cohere API error: {error}"
-                    ) from error
+                        "Extraction provider rate limit exceeded after "
+                        f"{MAX_ATTEMPTS} attempts."
+                    )
 
                 print(
-                    f"Rate limited by Cohere. Retrying in 60 seconds... "
+                    f"Rate limited. Retrying in 60 seconds... "
                     f"(attempt {attempt}/{MAX_ATTEMPTS})"
                 )
                 sleep(60)
 
-            except ApiError as error:
+            except ProviderError as error:
                 raise RuntimeError(
-                    f"Cohere API error: {error}"
+                    f"Extraction provider error: {error}"
                 ) from error
 
             except (
@@ -265,46 +242,27 @@ class TaskExtractor:
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = client.chat(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_input}
-                    ],
-                    response_format={"type": "json_object"},
-                    thinking={"type": "disabled"},
-                    temperature=0,
-                )
-
-                text_segments = [
-                    item
-                    for item in response.message.content
-                    if getattr(item, "type", None) == "text"
-                ]
-
-                if not text_segments:
-                    raise IndexError("The model returned no text content.")
-
-                raw_output = text_segments[0].text
+                raw_output = chat_json(system_prompt, user_input)
 
                 extracted_data = parse_llm_json(raw_output)
                 return ExtractionResult.model_validate(extracted_data)
 
-            except TooManyRequestsError as error:
+            except RateLimitedError:
                 if attempt >= MAX_ATTEMPTS:
                     raise RuntimeError(
-                        f"Cohere API error: {error}"
-                    ) from error
+                        "Extraction provider rate limit exceeded after "
+                        f"{MAX_ATTEMPTS} attempts."
+                    )
 
                 print(
-                    f"Rate limited by Cohere. Retrying in 60 seconds... "
+                    f"Rate limited. Retrying in 60 seconds... "
                     f"(attempt {attempt}/{MAX_ATTEMPTS})"
                 )
                 sleep(60)
 
-            except ApiError as error:
+            except ProviderError as error:
                 raise RuntimeError(
-                    f"Cohere API error: {error}"
+                    f"Extraction provider error: {error}"
                 ) from error
 
             except (

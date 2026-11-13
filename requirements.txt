@@ -1,4 +1,5 @@
 cohere
+openai
 pydantic
 python-dotenv
 sqlalchemy
