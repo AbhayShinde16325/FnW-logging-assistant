@@ -1,9 +1,9 @@
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 
 from database import search as task_search
 from database.connection import SessionLocal
 from database.models import Task
-from database.sql_execution import SqlAlchemyConnection, execute_operation
+from database.sql_execution import SqlAlchemyConnection, execute_operation, execute_sql
 
 
 def run_sql_operation(operation, *, confirmation=None):
@@ -24,6 +24,97 @@ def run_sql_operation(operation, *, confirmation=None):
             operation,
             connection=connection,
             confirmation=confirmation,
+        )
+
+        if result.get("status") == "success":
+            db.commit()
+        else:
+            db.rollback()
+
+        return result
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+def execute_read_sql(
+    sql,
+    params=None,
+    *,
+    max_rows: int = 200,
+    timeout_ms: int = 5000,
+):
+    """Execute one validated, read-only ``SELECT`` in a safe transaction.
+
+    The caller has already validated the statement with
+    ``database.sql_execution.validate_sql``. This function adds the runtime
+    protections that are not visible in the SQL text:
+
+    * the transaction is read-only,
+    * a statement timeout applies,
+    * at most ``max_rows`` rows are returned.
+
+    Values are always bound; the statement is never rebuilt with the values.
+    """
+
+    db = SessionLocal()
+
+    try:
+        db.execute(text("SET TRANSACTION READ ONLY"))
+        db.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
+
+        result = db.execute(text(sql), params or {})
+
+        if not getattr(result, "returns_rows", False):
+            raise ValueError("The read statement did not return rows.")
+
+        rows = [dict(row) for row in result.mappings().all()]
+        truncated = len(rows) > max_rows
+
+        return {
+            "status": "success",
+            "operation": "SELECT",
+            "rows": rows[:max_rows],
+            "row_count": min(len(rows), max_rows),
+            "truncated": truncated,
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+def execute_write_sql(
+    sql,
+    params=None,
+    *,
+    confirmation=None,
+    operation=None,
+):
+    """Validate and execute one write statement through the shared layer.
+
+    ``database.sql_execution.execute_sql`` applies the confirmation policy and
+    the SQL guardrails. The session is committed only on success.
+    """
+
+    db = SessionLocal()
+
+    try:
+        connection = SqlAlchemyConnection(db)
+
+        result = execute_sql(
+            sql,
+            params=params,
+            confirmation=confirmation,
+            operation=operation,
+            connection=connection,
         )
 
         if result.get("status") == "success":

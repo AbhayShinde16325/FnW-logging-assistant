@@ -484,3 +484,117 @@ def test_listing_another_employee_by_name_returns_nothing(monkeypatch):
 
     assert result["status"] == "success"
     assert result["tasks"] == []
+
+
+@requires_database
+def test_pending_tasks_include_in_progress_work(monkeypatch):
+    """'pending' in ordinary language means unfinished, not only PENDING."""
+
+    tag = marker()
+    pending_id = insert_task(
+        task_title=f"New report {tag}", assigned_to="Rahul",
+        status="PENDING", progress=0,
+    )
+    active_id = insert_task(
+        task_title=f"Active report {tag}", assigned_to="Rahul",
+        status="IN_PROGRESS", progress=30,
+    )
+    done_id = insert_task(
+        task_title=f"Done report {tag}", assigned_to="Rahul",
+        status="COMPLETED", progress=100,
+    )
+
+    # The model extracts the literal stored status; the wording of the
+    # request is what turns it into the open-work scope.
+    query = TaskQuery(
+        find=TaskUpdateFind(),
+        filters=TaskQueryFilters(status="PENDING"),
+    )
+    monkeypatch.setattr(
+        task_service, "extractor", ScriptedQueryExtractor(query)
+    )
+
+    result = task_service.process_list(
+        f"gather all pending tasks about {tag}", employee="Rahul"
+    )
+
+    assert result["status"] == "success"
+    ids = {task["id"] for task in result["tasks"]}
+    assert pending_id in ids
+    assert active_id in ids
+    assert done_id not in ids
+    assert result["filters"]["statuses"] == ["PENDING", "IN_PROGRESS"]
+
+
+@requires_database
+def test_explicit_status_pending_stays_exact(monkeypatch):
+    tag = marker()
+    pending_id = insert_task(
+        task_title=f"New report {tag}", assigned_to="Rahul",
+        status="PENDING", progress=0,
+    )
+    insert_task(
+        task_title=f"Active report {tag}", assigned_to="Rahul",
+        status="IN_PROGRESS", progress=30,
+    )
+
+    query = TaskQuery(
+        find=TaskUpdateFind(),
+        filters=TaskQueryFilters(status="PENDING"),
+    )
+    monkeypatch.setattr(
+        task_service, "extractor", ScriptedQueryExtractor(query)
+    )
+
+    result = task_service.process_list(
+        f"show tasks with status pending about {tag}", employee="Rahul"
+    )
+
+    assert [task["id"] for task in result["tasks"]] == [pending_id]
+    assert result["filters"]["statuses"] == ["PENDING"]
+
+
+@requires_database
+def test_an_empty_list_explains_the_filter(monkeypatch):
+    tag = marker()
+
+    query = TaskQuery(
+        find=TaskUpdateFind(),
+        filters=TaskQueryFilters(status="PENDING"),
+    )
+    monkeypatch.setattr(
+        task_service, "extractor", ScriptedQueryExtractor(query)
+    )
+
+    result = task_service.process_list(
+        f"gather all pending tasks about {tag}", employee="Rahul"
+    )
+
+    assert result["status"] == "success"
+    assert result["count"] == 0
+    assert "No open tasks found matching '" in result["reply"]
+
+
+@requires_database
+def test_an_assignee_is_not_used_as_a_title_filter(monkeypatch):
+    tag = marker()
+    owner = f"Rahul {tag}"
+    task_id = insert_task(
+        task_title=f"Business report {tag}", assigned_to=owner
+    )
+
+    query = TaskQuery(
+        find=TaskUpdateFind(assigned_to=owner),
+        filters=TaskQueryFilters(assigned_to=owner),
+    )
+    monkeypatch.setattr(
+        task_service, "extractor", ScriptedQueryExtractor(query)
+    )
+
+    result = task_service.process_list(
+        f"show all tasks assigned to {owner}", employee=owner
+    )
+
+    assert result["status"] == "success"
+    assert result["filters"]["title_contains"] is None
+    assert [task["id"] for task in result["tasks"]] == [task_id]

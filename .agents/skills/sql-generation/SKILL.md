@@ -116,17 +116,38 @@ A confirmation is valid only when it matches the operation exactly.
 
 Bare agreement such as `yes`, `ok`, `sure`, `go ahead`, or `do it` is not valid confirmation.
 
-## 7. Workflow
+## 7. Agent loop
 
-1. Read `DATABASE_SCHEMA.md`.
-2. Classify the request.
-3. If ambiguous, ask one clarification question and stop.
-4. If prohibited, refuse and explain why.
-5. Generate parameterized SQL that references only `tasks`.
-6. For `SELECT` and `INSERT`, execute without confirmation.
-7. For `UPDATE`, `DELETE`, or `DROP TABLE tasks`, return a `confirmation_required` result with the exact SQL, parameters, target table, impact, and required confirmation phrase.
-8. Only after the user supplies the exact phrase, execute the statement.
-9. Report the outcome without inventing rows or success that did not happen.
+Do not follow this as a rigid sequence. Treat it as a bounded reasoning loop:
+inspect the live schema, decide, act, observe the result, and repair.
+
+1. **Read the schema.** Use `DATABASE_SCHEMA.md`, `database/models.py` or the
+   schema prompt of the runtime. The columns and value rules are discovered,
+   never assumed.
+2. **Classify the request** as one of the operations in section 2.
+3. **Plan.** For a read, build a plan from the schema: columns, filters,
+   order, limit. For a write, build the structured operation described in
+   section 12. A plan is data, not SQL text.
+4. **Validate before acting.** Reject unknown columns, invalid values,
+   another table, joins and a missing specific `WHERE`.
+5. **Execute** a `SELECT` or `INSERT` without confirmation. For `UPDATE`,
+   `DELETE`, or `DROP TABLE tasks`, return the confirmation request and stop
+   until the exact phrase arrives.
+6. **Observe.** Look at the rows, the row count, the error, or the empty
+   result.
+7. **Repair, do not repeat.** Feed the observation back into the plan:
+   - an unknown column or operator: choose a schema column,
+   - an empty result: reconsider the filters (for example "pending" can mean
+     open work, not only the stored `PENDING` value),
+   - a validation error: correct the plan instead of retrying it unchanged.
+8. **Stop** after a small, fixed number of attempts and report the result
+   honestly. Never invent rows or success.
+
+The runtime uses the same loop in `services/agentic_read.py`: the model
+proposes a `ReadPlan`, `database/read_planner.py` validates and compiles it,
+and the execution layer validates the statement. The deterministic path
+remains the safety net when the model is unavailable or returns no usable
+plan.
 
 ## 8. Execution layer
 
@@ -193,6 +214,8 @@ This skill is also implemented in Python, so the running application obeys the s
 | Conversational state | `ai/query_session.py` |
 | Business operations | `services/task_service.py` |
 | SQL generation | `database/sql_generator.py` |
+| Schema-aware read plans | `database/read_planner.py` |
+| Agentic read loop (plan / observe / repair) | `services/agentic_read.py` |
 | SQL validation and execution | `database/sql_execution.py` |
 | Database access | `database/task_repository.py` |
 

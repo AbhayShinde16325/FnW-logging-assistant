@@ -39,6 +39,8 @@ services:
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
       WHISPER_MODEL_DIR: /home/app/.cache/whisper
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      AGENTIC_READ: ${AGENTIC_READ:-1}
+      DATABASE_AGENT: ${DATABASE_AGENT:-1}
     volumes:
       - whisper_cache:/home/app/.cache
     ports:

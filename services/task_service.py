@@ -19,6 +19,7 @@ lives in ``ai/query_session.py`` and the extraction in
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -53,6 +54,7 @@ from ai.query_session import (
     TaskUpdateEngine,
 )
 from ai.text_extractor import TaskExtractor, sync_status_progress
+from database import read_planner
 from database import search as task_search
 from database import task_fields
 from database.sql_execution import confirmation_phrase
@@ -71,6 +73,7 @@ from database.task_repository import (
     run_sql_operation,
     search_tasks,
 )
+from services.agentic_read import run_agentic_read
 from services.conversation_memory import (
     append_history,
     get_conversation_memory,
@@ -78,6 +81,7 @@ from services.conversation_memory import (
     save_conversation_memory,
     update_active_task,
 )
+from services.database_agent import run_database_agent
 from services.query_rewriter import rewrite_query_with_status
 from services.task_agent import ReadRequest, TaskAgent
 
@@ -1400,22 +1404,105 @@ def read_task(task_id: int, *, employee: str | None = None) -> dict:
     }
 
 
+def _status_counts(owner: str | None) -> dict:
+    """How many tasks are stored per status (scoped to the employee)."""
+
+    try:
+        rows = search_tasks(owner=owner) if owner else get_all_tasks()
+    except Exception:
+        return {}
+
+    counts: dict = {}
+
+    for row in rows:
+        status = _field(row, "status") or "PENDING"
+        counts[status] = counts.get(status, 0) + 1
+
+    return counts
+
+
+def _empty_list_reply(
+    *,
+    statuses: tuple[str, ...],
+    assigned_to: str | None,
+    title_contains: str | None,
+    owner: str | None,
+) -> str:
+    """Explain an empty list result instead of a generic "no match"."""
+
+    counts = _status_counts(owner)
+
+    if not counts:
+        if owner:
+            return "You have no tasks yet."
+        return "There are no tasks stored yet."
+
+    subject = ""
+
+    if statuses:
+        subject = (
+            "open"
+            if set(statuses) == set(read_planner.OPEN_STATUSES)
+            else " or ".join(statuses)
+        )
+
+    scope = f" matching '{title_contains}'" if title_contains else ""
+
+    if assigned_to:
+        if subject:
+            return f"No {subject} tasks{scope} are assigned to {assigned_to}."
+        return f"No tasks{scope} are assigned to {assigned_to}."
+
+    if statuses:
+        reply = f"No {subject} tasks found{scope}."
+
+        other = {
+            status: count
+            for status, count in counts.items()
+            if status not in statuses
+        }
+
+        if other:
+            summary = ", ".join(
+                f"{count} {status}" for status, count in sorted(other.items())
+            )
+            reply += f" You currently have {summary} task(s)."
+
+        return reply
+
+    if title_contains:
+        return f"No tasks match '{title_contains}'."
+
+    return "I couldn't find any task that matches."
+
+
 def process_list(
     user_input: str,
     *,
     employee: str | None = None,
 ) -> dict:
-    """List the existing tasks that match the request."""
+    """List the existing tasks that match the request.
+
+    The extraction model only supplies candidate filters; the wording of the
+    message is used as a deterministic safety net. If the model fails, returns
+    a generic phrase instead of a filter, or an over-specific filter hides the
+    rows, the flow still returns the right tasks. When enabled
+    (``AGENTIC_READ=1``) an agent can inspect a zero-row observation and plan
+    a corrected query.
+    """
+
+    from ai.text_extractor import TaskQuery
 
     try:
         query = extractor.extract_query(user_input)
-    except RuntimeError as error:
-        return {
-            "status": "error",
-            "intent": LIST_TASKS,
-            "message": str(error),
-            "reply": str(error),
-        }
+    except Exception as error:
+        # A provider outage must not make the list endpoint unusable: the
+        # wording-based fallback below is enough to answer the request.
+        logger.warning("The read request could not be extracted: %s", error)
+        query = TaskQuery()
+
+    if query is None:
+        query = TaskQuery()
 
     query = _trusted_task_id(user_input, query)
 
@@ -1439,48 +1526,83 @@ def process_list(
     ):
         assigned_to = requested_assignee
 
-    operation = build_select_operation(
-        status=filters.status,
-        assigned_to=assigned_to,
-        owner=owner,
-        title_contains=filters.title_contains,
-        intent=LIST_TASKS,
+    statuses = read_planner.resolve_statuses(user_input, filters.status)
+    title_contains = read_planner.clean_title_filter(
+        user_input,
+        filters.title_contains,
+        exclude=(
+            requested_assignee,
+            getattr(query.find, "assigned_to", None),
+        ),
     )
 
-    try:
-        validate_operation(operation)
-    except OperationError as error:
+    def run_query(title: str | None):
+        try:
+            operation = build_select_operation(
+                status=None if statuses else filters.status,
+                statuses=list(statuses) or None,
+                assigned_to=assigned_to,
+                owner=owner,
+                title_contains=title,
+                intent=LIST_TASKS,
+            )
+            validate_operation(operation)
+            result = run_sql_operation(operation)
+        except OperationError as error:
+            return None, str(error)
+        except Exception as error:
+            logger.exception("The tasks could not be loaded: %s", error)
+            return None, "I couldn't load the tasks right now."
+
+        if result.get("status") != "success":
+            return None, result.get("message") or "The tasks could not be loaded."
+
+        rows = result.get("rows") or []
+        tasks = [serialize_task(row) for row in rows]
+
+        if title:
+            tasks = task_search.rank(tasks, title, fields=("task_title",))
+
+        return tasks, None
+
+    tasks, error = run_query(title_contains)
+
+    if error is not None:
         return {
             "status": "error",
             "intent": LIST_TASKS,
-            "message": str(error),
-            "reply": str(error),
+            "message": error,
+            "reply": error,
         }
 
-    result = run_sql_operation(operation)
+    note = ""
+    planner = "structured"
 
-    if result.get("status") != "success":
-        message = result.get("message") or "The tasks could not be loaded."
-        return {
-            "status": "error",
-            "intent": LIST_TASKS,
-            "message": message,
-            "reply": message,
-        }
+    if not tasks and not assigned_to and _status_counts(owner):
+        agent_result = run_agentic_read(user_input, employee=owner)
 
-    rows = result.get("rows") or []
-    tasks = [serialize_task(row) for row in rows]
+        if agent_result is not None:
+            planner = "agentic"
 
-    if filters.title_contains:
-        tasks = task_search.rank(
-            tasks, filters.title_contains, fields=("task_title",)
-        )
+            rows = agent_result.get("rows") or []
+
+            if rows:
+                tasks = [serialize_task(row) for row in rows]
+                note = (
+                    "The first query returned no rows, so I adjusted the "
+                    "filters:\n\n"
+                )
 
     if not tasks:
-        reply = "I couldn't find any task that matches."
+        reply = _empty_list_reply(
+            statuses=statuses,
+            assigned_to=assigned_to,
+            title_contains=title_contains,
+            owner=owner,
+        )
     else:
         lines = "\n".join(_task_choice_line(task) for task in tasks)
-        reply = f"I found {len(tasks)} task(s):\n{lines}"
+        reply = f"{note}I found {len(tasks)} task(s):\n{lines}"
 
     return {
         "status": "success",
@@ -1489,6 +1611,12 @@ def process_list(
         "reply": reply,
         "count": len(tasks),
         "tasks": tasks,
+        "planner": planner,
+        "filters": {
+            "statuses": list(statuses) or None,
+            "assigned_to": assigned_to,
+            "title_contains": title_contains,
+        },
     }
 
 
@@ -2013,6 +2141,13 @@ def _remember_turn(
     candidates = _displayed_candidates(result)
     clarification = _clarification_of_result(result)
 
+    agent_context = (result or {}).get("agent_context") or {}
+    agent_candidates = agent_context.get("candidates") or []
+    agent_trace = agent_context.get("trace") or []
+
+    if not candidates and agent_candidates:
+        candidates = agent_candidates[:MAX_SELECTION_CANDIDATES]
+
     if (result or {}).get("status") != "success":
         context = {}
 
@@ -2031,6 +2166,9 @@ def _remember_turn(
         if clarification:
             context["clarification"] = clarification
 
+        if agent_trace:
+            context["agent_trace"] = agent_trace[-8:]
+
         if not context:
             # The turn started something else, so an older clarification is
             # not waiting any more. A failed operation never changes the
@@ -2039,6 +2177,7 @@ def _remember_turn(
                 "pending": {},
                 "candidates": [],
                 "clarification": {},
+                "agent_trace": [],
             }
 
         try:
@@ -2057,6 +2196,12 @@ def _remember_turn(
 
     # A completed interaction closes the pending clarification.
     cleared = {"pending": {}, "candidates": [], "clarification": {}}
+
+    if candidates:
+        cleared["candidates"] = candidates[:MAX_SELECTION_CANDIDATES]
+
+    if agent_trace:
+        cleared["agent_trace"] = agent_trace[-8:]
 
     try:
         if intent == DELETE_TASK:
@@ -2085,6 +2230,67 @@ def _remember_turn(
         )
     except Exception as error:
         logger.warning("The conversation memory could not be stored: %s", error)
+
+
+# --- LLM database agent entry point ----------------------------------------------------
+
+
+AGENT_ENABLED_VALUES = {"1", "true", "yes", "on"}
+
+
+def _database_agent_enabled() -> bool:
+    """The LLM/tool agent is opt-in through ``DATABASE_AGENT``."""
+
+    return os.getenv("DATABASE_AGENT", "").strip().lower() in AGENT_ENABLED_VALUES
+
+
+def _run_database_agent_turn(
+    user_input: str,
+    *,
+    employee: str | None,
+    user_id: str | None,
+    conversation_id: str | None,
+) -> dict | None:
+    """Let the LLM choose tools for one fresh turn.
+
+    ``None`` means the agent is disabled or could not start, so the caller can
+    keep the existing deterministic flow. Once the agent has produced a
+    result, the conversation memory is updated here because the agent path
+    bypasses ``_with_memory``.
+    """
+
+    transcript = (user_input or "").strip()
+
+    if not transcript:
+        return None
+
+    memory = _load_memory(user_id, employee, conversation_id)
+
+    try:
+        result = run_database_agent(
+            transcript,
+            employee=employee,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            memory=memory,
+            confirmation=transcript,
+        )
+    except Exception:
+        logger.exception("The database agent turn failed; using the fallback flow.")
+        return None
+
+    if result is None:
+        return None
+
+    _remember_turn(
+        user_id=user_id,
+        employee=employee,
+        conversation_id=conversation_id,
+        user_message=transcript,
+        result=result,
+    )
+
+    return result
 
 
 # --- entry points ---------------------------------------------------------------------
@@ -2393,6 +2599,20 @@ def process_chat_turn(
 
     transcript = (user_input or "").strip()
 
+    # A fresh turn can be understood by the LLM tool agent, which owns its
+    # own context resolution. Staged turns (answers to a running question)
+    # stay in the existing state machine.
+    if stage in FRESH_STAGES and _database_agent_enabled():
+        agent_result = _run_database_agent_turn(
+            transcript,
+            employee=employee,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
+        if agent_result is not None:
+            return agent_result
+
     return _with_memory(
         transcript,
         conversation_id=conversation_id,
@@ -2571,6 +2791,17 @@ def process_voice_turn(
     transcript = (user_input or "").strip()
 
     if stage in (None, "", "start"):
+        if _database_agent_enabled():
+            agent_result = _run_database_agent_turn(
+                transcript,
+                employee=employee,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+
+            if agent_result is not None:
+                return agent_result
+
         return _with_memory(
             transcript,
             conversation_id=conversation_id,

@@ -83,6 +83,8 @@ CORS_ORIGINS=http://localhost:5173
 WHISPER_MODEL_SIZE=small
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
+DATABASE_AGENT=1            # LLM tool-calling database agent
+AGENTIC_READ=1              # let the read planner repair a zero-row query
 ```
 
 If `FRONTEND_PORT` or `BACKEND_PORT` is already in use on the server, change

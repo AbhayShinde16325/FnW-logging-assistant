@@ -19,13 +19,20 @@
 
 The SQL skill is implemented in Python as well, so the running API obeys the same rules:
 
-- `ai/intent_detection.py` decides what the employee wants before any extraction happens (`CREATE_TASK`, `UPDATE_TASK`, `GET_TASK`, `LIST_TASKS`, `DELETE_TASK`, `GENERAL_QUERY`, `CLARIFICATION_REQUIRED`).
-- `database/sql_generator.py` builds a structured operation (table, task ID, columns, values) and validates it before anything is executed.
-- `database/sql_execution.py` validates the statement and executes it with bound parameters.
-- `database/task_repository.py` is the only module that talks to PostgreSQL.
-- `services/task_service.py` orchestrates the flow; `app.py` only routes HTTP.
+- `ai/tool_calling.py` wraps the existing provider's native function/tool calling. It returns text, tool calls and a plan; it never touches the database.
+- `services/database_agent.py` is the LLM-controlled loop. The model receives the live schema, conversation context and tool contracts, chooses a tool, observes the result and decides what to do next. It never routes on hardcoded intent keywords.
+- Agent tools: `inspect_database_schema`, `inspect_table_definition`, `validate_sql_query`, `execute_read_query`, `execute_write_query`, `retrieve_conversation_context`, `update_conversation_context`.
+- `database/sql_execution.py` validates every model-generated statement (one statement, only `tasks`, no joins, no prohibited operations, specific `WHERE` for writes, exact confirmation for destructive statements) and binds every value.
+- `database/task_repository.py` executes reads in a read-only transaction with a statement timeout and a row cap; it is the only module that talks to PostgreSQL.
+- `database/sql_generator.py` and `database/read_planner.py` remain the deterministic fallback path (structured operations and schema-aware plans).
+- `ai/intent_detection.py`, `services/agentic_read.py`, `services/query_rewriter.py` and the staged flows remain as the fallback when `DATABASE_AGENT` is off or the agent cannot start.
+- `services/task_service.py` selects the agent for fresh chat/voice turns and keeps the existing state machine for staged turns; `app.py` only routes HTTP.
 
-Never let a model write SQL, a task ID, a column name or a database value.
+The model may generate SQL, but it never executes it directly. Every statement passes `validate_sql` first, reads run read-only and bounded, employee-scoped reads must return `assigned_to` and are filtered to the employee, and employee-scoped writes must carry an `assigned_to` predicate with the employee value bound. The confirmation phrase is taken from the employee's actual message, never from the model. A model may not invent a task ID or a value outside the live schema.
+
+Enable the agent with `DATABASE_AGENT=1` (Compose default). The deterministic flows handle any turn the agent cannot start, and staged clarification answers stay in the existing state machine.
+
+"Pending" in ordinary language means open work (`PENDING` and `IN_PROGRESS`). Use the exact `PENDING` value only when the employee says "status is pending" or otherwise refers to the stored status. `database/read_planner.py` owns this rule.
 
 See section 12 of `.agents/skills/sql-generation/SKILL.md`.
 

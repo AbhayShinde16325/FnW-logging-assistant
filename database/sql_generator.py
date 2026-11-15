@@ -218,6 +218,7 @@ def build_select_operation(
     *,
     task_id: int | None = None,
     status: str | None = None,
+    statuses: list[str] | tuple[str, ...] | None = None,
     assigned_to: str | None = None,
     owner: str | None = None,
     title_contains: str | None = None,
@@ -240,7 +241,26 @@ def build_select_operation(
         conditions.append("id = :task_id")
         params["task_id"] = _validate_task_id(task_id)
 
-    if status is not None:
+    if statuses:
+        normalized_statuses = []
+
+        for value in statuses:
+            if not isinstance(value, str) or value.upper() not in STATUS_VALUES:
+                raise OperationError(
+                    "status must be PENDING, IN_PROGRESS, or COMPLETED."
+                )
+            if value.upper() not in normalized_statuses:
+                normalized_statuses.append(value.upper())
+
+        if normalized_statuses:
+            keys = []
+            for index, value in enumerate(normalized_statuses):
+                key = f"status_{index}"
+                keys.append(f":{key}")
+                params[key] = value
+            conditions.append("status IN (" + ", ".join(keys) + ")")
+
+    elif status is not None:
         if status.upper() not in STATUS_VALUES:
             raise OperationError(
                 "status must be PENDING, IN_PROGRESS, or COMPLETED."
@@ -288,6 +308,7 @@ def build_select_operation(
         "table": TASK_TABLE,
         "task_id": task_id,
         "status": status.upper() if status else None,
+        "statuses": list(statuses or []) or None,
         "assigned_to": assigned_to,
         "owner": owner,
         "title_contains": title_contains,

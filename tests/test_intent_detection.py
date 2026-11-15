@@ -67,6 +67,12 @@ def test_get_requests(message, expected):
     "message, expected",
     [
         ("Show all my pending tasks.", LIST_TASKS),
+        ("show tasks with status pending", LIST_TASKS),
+        ("what tasks are pending", LIST_TASKS),
+        ("which tasks are in progress", LIST_TASKS),
+        ("tasks that are pending", LIST_TASKS),
+        ("get all tasks", LIST_TASKS),
+        ("gather all pending tasks", LIST_TASKS),
         ("list all tasks", LIST_TASKS),
         ("give me an overview of my tasks", LIST_TASKS),
     ],

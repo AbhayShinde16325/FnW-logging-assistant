@@ -173,6 +173,11 @@ CREATE_PATTERN = re.compile(
 # Requests that span several tasks.
 LIST_PATTERN = re.compile(
     r"\blist\b|\bshow (me )?(all|every)\b|\b(all|every) (my|the)\b"
+    r"|\bshow\b[^.]{0,30}\btasks\b|\bget\b[^.]{0,30}\btasks\b"
+    r"|\b(all|every|any)\b[^.]{0,30}\btasks?\b"
+    r"|\b(what|which|how many)\b[^.]{0,25}\btasks?\b"
+    r"|^\s*(?:the\s+)?tasks?\b[^.]{0,30}\b(pending|open|in progress|"
+    r"completed|overdue|due|assigned)\b"
     r"|\bmy tasks\b|\bpending tasks\b|\bin progress tasks\b"
     r"|\bcompleted tasks\b|\boverdue tasks\b|\bupcoming tasks\b"
     r"|\bsummar(y|ise|ize)\b|\boverview\b",
@@ -444,7 +449,12 @@ def detect_intent(user_input: str, *, task_in_context: bool | None = None) -> In
 
         return Intent(UPDATE_TASK, "The message asks to change an existing task.")
 
-    # 3b. GET - a question about one task property. It is a read even when
+    # 3b. LIST - a question about several tasks ("which tasks are in
+    #     progress") is a list even though it names a task property.
+    if LIST_PATTERN.search(text) and PLURAL_TASK_PATTERN.search(text):
+        return Intent(LIST_TASKS, "The message asks for several tasks.")
+
+    # 3c. GET - a question about one task property. It is a read even when
     #     the message does not repeat the word "task".
     if FIELD_QUESTION_PATTERN.search(text):
         if task_in_context is False:
