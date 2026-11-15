@@ -174,41 +174,59 @@ def test_edit_during_confirmation_round_trip(client, staged_service):
     assert edited["draft"]["progress"] == 80
 
 
-def test_update_flow_unchanged(client, staged_service, monkeypatch):
-    # UPDATE keeps the single-shot behaviour: fake it end to end.
-    class UpdateExtractor(FakeExtractor):
-        def extract_task(self, user_input):
-            from ai.text_extractor import TaskDetails
+def test_update_flow_changes_the_existing_task(client, staged_service, monkeypatch):
+    """An UPDATE request must change the stored row, never create one."""
 
-            return TaskDetails(
-                task_title="Python API research",
-                assigned_to="Rahul",
-                assigned_date="2026-11-10",
-                assigned_time="10:30",
-                deadline_date="2026-11-15",
-                deadline_time="17:00",
-                status="IN_PROGRESS",
-                progress=80,
+    from datetime import date, time
+    from types import SimpleNamespace
+
+    from ai.text_extractor import TaskUpdate, TaskUpdateChanges, TaskUpdateFind
+
+    task = SimpleNamespace(
+        id=1,
+        task_title="Python API research",
+        assigned_to="Rahul",
+        assigned_date=date(2026, 11, 10),
+        assigned_time=time(10, 30),
+        deadline_date=date(2026, 11, 15),
+        deadline_time=time(17, 0),
+        reminder_date=None,
+        reminder_time=None,
+        status="IN_PROGRESS",
+        progress=50,
+    )
+
+    class UpdateExtractor(FakeExtractor):
+        def extract_update(self, user_input):
+            return TaskUpdate(
+                find=TaskUpdateFind(task_id=1),
+                changes=TaskUpdateChanges(status="COMPLETED", progress=100),
             )
+
+    def fake_run(operation, *, confirmation=None):
+        for key, value in operation["updates"].items():
+            setattr(task, key, value)
+        return {"status": "success", "operation": "UPDATE", "rows": []}
 
     monkeypatch.setattr(task_service, "extractor", UpdateExtractor(full_extraction()))
     monkeypatch.setattr(
-        task_service,
-        "update_task",
-        lambda task_id, updates: {"id": task_id, "progress": updates["progress"]},
+        task_service, "get_task", lambda task_id: task if task_id == 1 else None
     )
+    monkeypatch.setattr(task_service, "run_sql_operation", fake_run)
 
     response = client.post(
         "/tasks/text",
         json={
-            "text": "Update the Python API research task, now 80 percent done",
-            "task_id": 1,
+            "text": "Update my Python API research task, now 100 percent done",
         },
     )
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
-    assert body["task"]["progress"] == 80
+    assert body["intent"] == "UPDATE_TASK"
+    assert body["task"]["status"] == "COMPLETED"
+    assert body["task"]["progress"] == 100
+    assert task.progress == 100
 
 
 def test_chat_asks_one_field_at_a_time_and_updates_draft(client, staged_service):
@@ -273,3 +291,96 @@ def test_chat_asks_one_field_at_a_time_and_updates_draft(client, staged_service)
     final = response.json()
     assert final["status"] == "success"
     assert final["reply"] == "Task created successfully."
+
+
+def test_chat_syncs_pending_status_with_progress(client, staged_service):
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "Rahul has a Python API research task",
+            "stage": "start",
+        },
+    )
+    first = response.json()
+    assert first["missing_fields"] == ["status"]
+    assert first["draft"]["progress"] == 50
+
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "pending",
+            "stage": first["stage"],
+            "draft": first["draft"],
+        },
+    )
+    second = response.json()
+
+    assert second["status"] == "confirmation_required"
+    assert second["draft"]["status"] == "IN_PROGRESS"
+    assert second["draft"]["progress"] == 50
+
+
+def test_chat_escapes_loop_when_all_fields_are_filled(client, staged_service):
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "Rahul has a Python API research task",
+            "stage": "start",
+        },
+    )
+    first = response.json()
+    draft = first["draft"]
+    draft["status"] = "PENDING"
+
+    response = client.post(
+        "/tasks/chat",
+        json={
+            "message": "IN_PROGRESS",
+            "stage": "fields",
+            "draft": draft,
+        },
+    )
+    second = response.json()
+
+    assert second["status"] == "confirmation_required"
+    assert second["draft"]["status"] == "IN_PROGRESS"
+    assert "must be IN_PROGRESS" not in second["reply"]
+
+
+def test_list_tasks_returns_all_task_details(client, monkeypatch):
+    from datetime import date, time
+    from types import SimpleNamespace
+
+    sample = SimpleNamespace(
+        id=7,
+        task_title="Python API research",
+        assigned_to="Rahul",
+        assigned_date=date(2026, 11, 10),
+        assigned_time=time(10, 30),
+        deadline_date=date(2026, 11, 15),
+        deadline_time=time(17, 0),
+        reminder_date=date(2026, 11, 15),
+        reminder_time=time(16, 30),
+        status="IN_PROGRESS",
+        progress=50,
+    )
+
+    monkeypatch.setattr(app_module, "get_all_tasks", lambda: [sample])
+
+    response = client.get("/tasks")
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["count"] == 1
+
+    task = body["tasks"][0]
+    assert task["id"] == 7
+    assert task["task_title"] == "Python API research"
+    assert task["assigned_date"] == "2026-11-10"
+    assert task["assigned_time"] == "10:30"
+    assert task["deadline_date"] == "2026-11-15"
+    assert task["deadline_time"] == "17:00"
+    assert task["reminder_date"] == "2026-11-15"
+    assert task["reminder_time"] == "16:30"
+    assert task["status"] == "IN_PROGRESS"
+    assert task["progress"] == 50

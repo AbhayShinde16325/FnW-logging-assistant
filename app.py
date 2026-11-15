@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import (
@@ -12,9 +13,11 @@ from fastapi import (
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from database.connection import create_tables
+from database.task_repository import get_all_tasks
 
 from voice.speech_to_text import (
     transcribe_audio,
@@ -25,6 +28,8 @@ from services.task_service import (
     process_task,
     process_chat_turn,
     process_voice_turn,
+    read_task,
+    serialize_task,
 )
 
 
@@ -60,12 +65,17 @@ app = FastAPI(
 )
 
 
-# CORS configuration
+# CORS configuration. Comma-separated origins can be provided through
+# CORS_ORIGINS; the local development frontend is allowed by default.
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173"
-    ],
+    allow_origins=CORS_ORIGINS or ["http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -83,6 +93,10 @@ class TaskRequest(BaseModel):
     answers: dict | None = None
     reminder_text: str | None = None
     confirm: bool = False
+    # The employee talking to the assistant. When it is given, task lookups
+    # are restricted to that employee and every write carries the ownership
+    # condition.
+    employee: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -94,6 +108,12 @@ class ChatRequest(BaseModel):
     answers: dict | None = None
     reminder_text: str | None = None
     confirm: bool = False
+    confirm_delete: bool = False
+    employee: str | None = None
+    # The conversation the turn belongs to. Together with the user id it
+    # identifies the stored conversation memory.
+    conversation_id: str | None = None
+    user_id: str | None = None
 
 
 # Health check
@@ -104,6 +124,71 @@ def health_check():
         "status": "healthy",
         "message": "Task Flow Automation API is running."
     }
+
+
+def _serialize_task(task) -> dict:
+    return serialize_task(task)
+
+
+# LIST TASKS ENDPOINT
+@app.get("/tasks")
+def list_tasks():
+
+    try:
+
+        logger.info("Fetching all tasks.")
+
+        tasks = get_all_tasks()
+
+        return {
+            "count": len(tasks),
+            "tasks": [_serialize_task(task) for task in tasks],
+        }
+
+    except Exception:
+
+        logger.exception("Failed to fetch tasks.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to load tasks."
+        )
+
+
+# READ ONE TASK ENDPOINT
+@app.get("/tasks/{task_id}")
+def read_task_by_id(task_id: int):
+
+    try:
+
+        logger.info("Fetching task %s.", task_id)
+
+        result = read_task(task_id)
+
+        # A task that does not exist is answered with the same shape as a
+        # task that does, so a client never hits a KeyError on "task".
+        if result.get("status") == "not_found":
+            return JSONResponse(status_code=404, content=jsonable_encoder(result))
+
+        return jsonable_encoder(result)
+
+    except ValueError as error:
+
+        logger.warning("Task validation error: %s", error)
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception:
+
+        logger.exception("Failed to fetch task.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to load the task."
+        )
 
 
 # TEXT INPUT ENDPOINT
@@ -123,6 +208,7 @@ def handle_text(request: TaskRequest):
             answers=request.answers,
             reminder_text=request.reminder_text,
             confirm=request.confirm,
+            employee=request.employee,
         )
 
         logger.info("Text task processing completed.")
@@ -163,6 +249,10 @@ def handle_chat(request: ChatRequest):
             answers=request.answers,
             reminder_text=request.reminder_text,
             confirm=request.confirm,
+            confirm_delete=request.confirm_delete,
+            employee=request.employee,
+            conversation_id=request.conversation_id,
+            user_id=request.user_id,
         )
 
         logger.info("Chat conversation turn processed.")
@@ -237,6 +327,9 @@ def handle_voice(
     reminder_text: str | None = Form(None),
     confirm: bool = Form(False),
     state: str | None = Form(None),
+    employee: str | None = Form(None),
+    conversation_id: str | None = Form(None),
+    user_id: str | None = Form(None),
 ):
 
     try:
@@ -284,6 +377,9 @@ def handle_voice(
             answers=voice_state.get("answers"),
             reminder_text=reminder_text or voice_state.get("reminder_text"),
             confirm=confirm or bool(voice_state.get("confirm")),
+            employee=employee or voice_state.get("employee"),
+            conversation_id=conversation_id or voice_state.get("conversation_id"),
+            user_id=user_id or voice_state.get("user_id"),
         )
 
         logger.info("Voice task processing completed.")

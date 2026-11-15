@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from sqlalchemy import text
+
 ALLOWED_OPERATIONS = frozenset({"SELECT", "INSERT", "UPDATE", "DELETE", "DROP TABLE"})
 
 CONFIRMATION_PHRASES = {
@@ -381,15 +383,97 @@ def execute_sql(
     if connection is None:
         raise ValueError("A database connection is required to execute SQL.")
 
-    connection.execute(sql, params if params is not None else {})
+    try:
+        outcome = connection.execute(sql, params if params is not None else {})
+    except Exception:
+        rollback = getattr(connection, "rollback", None)
+        if callable(rollback):
+            rollback()
+        raise
 
-    return {
+    if validation.operation != "SELECT":
+        commit = getattr(connection, "commit", None)
+        if callable(commit):
+            commit()
+
+    result = {
         "status": "success",
         "operation": validation.operation,
         "sql": sql,
         "params": params,
         "executed": True,
     }
+
+    if isinstance(outcome, list):
+        result["rows"] = outcome
+    elif isinstance(outcome, int):
+        result["rowcount"] = outcome
+
+    return result
+
+
+class SqlAlchemyConnection:
+    """Adapter that lets the execution layer run SQL through SQLAlchemy.
+
+    The statements produced by the SQL generation component use named
+    placeholders (``:task_id``); this adapter binds them through
+    ``sqlalchemy.text`` so no value is ever inlined into the statement.
+    """
+
+    def __init__(self, session):
+        self._session = session
+
+    def execute(self, sql: str, params=None):
+        result = self._session.execute(text(sql), params or {})
+
+        if getattr(result, "returns_rows", False):
+            return [dict(row) for row in result.mappings().all()]
+
+        return result.rowcount
+
+    def commit(self) -> None:
+        self._session.commit()
+
+    def rollback(self) -> None:
+        self._session.rollback()
+
+
+def execute_operation(
+    operation: dict,
+    *,
+    connection: object | None = None,
+    confirmation: str | None = None,
+) -> dict:
+    """Execute a structured, already validated operation.
+
+    The operation is the JSON shape produced by
+    ``database.sql_generator.build_*_operation``: the intent, the operation
+    type, the table, the task id and the values to write. It is validated
+    again here (both the structure and the SQL text) before it reaches the
+    database, so an invalid or tampered operation can never be executed.
+    """
+
+    if not isinstance(operation, dict):
+        return _error_result("The operation must be a JSON object.", None)
+
+    sql = operation.get("sql")
+    params = operation.get("params")
+    operation_type = operation.get("operation")
+
+    if not isinstance(sql, str) or not sql.strip():
+        return _error_result("The operation has no SQL statement.", None)
+
+    if operation.get("table") != "tasks":
+        return _error_result("Only the tasks table may be referenced.", sql, params)
+
+    return execute_sql(
+        sql,
+        params=params,
+        confirmation=confirmation,
+        operation=operation_type,
+        connection=connection,
+    )
+
 
 
 def _normalize_operation_label(value: object) -> str | None:

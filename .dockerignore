@@ -1,0 +1,38 @@
+.git
+.gitignore
+.gitattributes
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python
+venv
+.venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+build
+dist
+
+# Tests and caches
+.pytest_cache
+.coverage
+htmlcov
+tests
+
+# Frontend is built in its own image
+frontend
+
+# Logs and local files
+*.log
+*.tmp
+*.bak
+*.db
+*.sqlite3
+.DS_Store
+.vscode
+.idea

@@ -11,6 +11,8 @@ statement.
 
 - Only the `tasks` table may be referenced. No other tables, no joins, no
   schema changes (`ALTER`, `CREATE TABLE`, etc.).
+  The application-internal table `conversation_memory` (see below) is not part
+  of this skill: it is only read and written through the ORM.
 - Allowed operations are `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and
   `DROP TABLE tasks`.
 - `SELECT` and `INSERT` require no confirmation.
@@ -68,6 +70,96 @@ Mapped class: `database.models.Task`.
   reminder is considered not set.
 - NULL means "not stated"; do not invent dates/times or substitute `CURRENT_DATE`.
 
+## Table: `conversation_memory`
+
+Mapped class: `database.models.ConversationMemory`.
+
+This table belongs to the **application**, not to the SQL generation skill.
+The skill still may only reference the `tasks` table; this table is read and
+written through the ORM in `services/conversation_memory.py` only.
+
+It stores the small, persistent memory of one conversation, so a follow-up
+message ("also update its deadline") can be understood after a restart of the
+backend.
+
+| Column            | SQLAlchemy type | Postgres type        | Nullable | Default              | Constraints / notes                                    |
+| ----------------- | --------------- | -------------------- | -------- | -------------------- | ------------------------------------------------------ |
+| `id`              | `Integer`       | `integer`            | NOT NULL | autoincrement        | Primary key, indexed (`ix_conversation_memory_id`).     |
+| `conversation_id` | `String`        | `varchar`            | NOT NULL | none                 | Identifies the conversation, indexed.                   |
+| `user_id`         | `String`        | `varchar`            | NOT NULL | none                 | Identifies the user, indexed.                           |
+| `active_task_id`  | `Integer`       | `integer`            | NULL     | none                 | The task the employee is working on, indexed.           |
+| `last_action`     | `String`        | `varchar`            | NULL     | none                 | The last action that was carried out successfully.      |
+| `context`         | `JSON`/`JSONB`  | `jsonb`              | NULL     | `{}`                 | Snapshot of the active task and the last turns.        |
+| `updated_at`      | `DateTime`      | `timestamp without time zone` | NOT NULL | now (UTC)  | Written on every change.                               |
+
+- `UNIQUE (user_id, conversation_id)` - there is exactly one memory per user
+  and conversation (`uq_conversation_memory_user_conversation`).
+- The `context` column holds a small JSON structure, never a full transcript:
+
+  ```json
+  {
+    "active_task": {"id": 211, "task_title": "Business report", "assigned_to": "Rahul",
+                    "status": "IN_PROGRESS", "progress": 10, "deadline_date": "2026-11-21"},
+    "history": [
+      {"role": "user", "text": "...", "at": "2026-11-13T09:30:00"},
+      {"role": "assistant", "text": "...", "at": "2026-11-13T09:30:01"}
+    ],
+    "pending": {"instruction": "Update the progress of the business report to 10%",
+                "changes": {"progress": 10}, "find": {}, "task_id": null},
+    "candidates": [{"id": 211, "task_title": "Business report"}],
+    "clarification": {"stage": "select_task", "action": "update",
+                      "intent": "CLARIFICATION_REQUIRED",
+                      "changes": {"progress": 10}, "find": {}, "task_id": null}
+  }
+  ```
+
+- The history keeps the last 10 messages, each with a UTC timestamp (`at`).
+  It is read newest-first, limited to 10, then sent to the model in
+  chronological order.
+- `pending` holds the change the employee asked for while the task of the
+  change is still unknown. It is cleared as soon as the change is applied.
+- `candidates` keeps the task candidates that were displayed (at most 10), so
+  "the second one" or "the previous one" can still be resolved after a
+  restart.
+- `clarification` keeps the stage and the draft of a waiting clarification.
+  It is cleared together with `pending` after a successful operation or when
+  the employee starts a different operation.
+
+### Verification queries
+
+```sql
+-- every stored memory
+SELECT id, user_id, conversation_id, active_task_id, last_action, updated_at
+FROM conversation_memory
+ORDER BY updated_at DESC;
+
+-- the memory of one conversation
+SELECT context FROM conversation_memory
+WHERE user_id = 'user-1' AND conversation_id = 'conversation-1';
+
+-- the active task of every conversation
+SELECT user_id, conversation_id, active_task_id, last_action
+FROM conversation_memory
+WHERE active_task_id IS NOT NULL
+ORDER BY updated_at DESC;
+
+-- the conversations of one user
+SELECT conversation_id, active_task_id, updated_at
+FROM conversation_memory
+WHERE user_id = 'user-1'
+ORDER BY updated_at DESC;
+
+-- the memory of a task that is still active
+SELECT count(*) FROM conversation_memory WHERE active_task_id = 211;
+
+-- the stored turns of one conversation, oldest first
+SELECT turn->>'role' AS role, turn->>'text' AS text, turn->>'at' AS at
+FROM conversation_memory,
+     jsonb_array_elements(context->'history') AS turn
+WHERE user_id = 'user-1' AND conversation_id = 'conversation-1'
+ORDER BY turn->>'at';
+```
+
 ## Query generation rules
 
 1. Only query the `tasks` table; there are no joins or other tables.
@@ -85,8 +177,13 @@ Mapped class: `database.models.Task`.
 7. Date/time output should use `to_char(<date_column>, 'YYYY-MM-DD')` and
    `to_char(<time_column>, 'HH24:MI')` when formatting for display, applying
    this to assigned, deadline, and reminder date/time columns.
-8. Case-insensitive text search: `ILIKE '%term%'`.
+8. Case-insensitive text search: `ILIKE '%term%'`. A multi-word search is
+   split into concepts (`database/search.py`) and each concept becomes an
+   `ILIKE` parameter joined with `OR`; the returned rows are ranked by
+   relevance. The title, the assignee and the status are searchable.
 9. Progress/status filters must use the canonical uppercase status values.
+10. An ownership scope is an exact, case-insensitive match
+    (`assigned_to ILIKE :owner`, no wildcards), never a partial match.
 
 ## Common query templates
 
@@ -212,3 +309,30 @@ DROP TABLE tasks;
   as "not set" rather than `null`.
 - For counts, use `COUNT(*)`, e.g.
   `SELECT status, COUNT(*) FROM tasks GROUP BY status ORDER BY status;`
+
+## How the application uses this schema
+
+The API never runs a statement that a model wrote. The runtime path is:
+
+1. `ai/intent_detection.py` classifies the employee message.
+2. `ai/text_extractor.py` reads only the values that were stated.
+3. `database/sql_generator.py` derives the statement from the ORM model in
+   `database/models.py` and returns a structured operation
+   (`intent`, `operation`, `table`, `task_id`, `updates`, `sql`, `params`).
+4. `database/sql_generator.validate_operation` and
+   `database/sql_execution.validate_sql` check the operation and the
+   statement.
+5. `database/sql_execution.execute_operation` runs it through
+   `SqlAlchemyConnection`, which binds every value as a parameter.
+6. `database/task_repository.py` re-reads the row and the service serialises
+   it for the response.
+
+Consequences for the statements above:
+
+- The `WHERE` clause of an `UPDATE` always contains `id = :task_id` and, when
+  the employee is known, `assigned_to = :assigned_to`.
+- Values are always bound; a value that looks like SQL (`'; DROP TABLE
+  tasks; --`) is stored as plain text.
+- `INSERT` is only used for an explicit task creation; an update never
+  inserts a row.
+- `DELETE` needs the exact phrase `CONFIRM DELETE` before it runs.

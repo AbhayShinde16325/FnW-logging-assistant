@@ -21,7 +21,8 @@ from datetime_resolver import ResolutionStatus, resolve
 
 import config
 from ai.reminder import ReminderError, parse_reminder
-from ai.text_extractor import TaskRecord, validate_business_rules
+from ai.text_extractor import TaskRecord, sync_status_progress
+from database import search as task_search
 
 
 FALLBACK_TIMEZONE = "Asia/Kolkata"
@@ -32,6 +33,14 @@ STAGE_CONFIRM_FIELDS = "confirm_fields"
 STAGE_REMINDER = "reminder"
 STAGE_CONFIRM_REMINDER = "confirm_reminder"
 STAGE_DONE = "done"
+
+# Stages of the "change an existing task" conversation. They are kept apart
+# from the CREATE stages so a pending update is never mistaken for a new
+# task draft.
+STAGE_SELECT_TASK = "select_task"
+STAGE_CONFIRM_UPDATE = "confirm_update"
+STAGE_CONFIRM_DELETE = "confirm_delete"
+STAGE_UPDATE = "update"
 
 # Phase A fields, in the order they are asked about.
 FIELD_ORDER = [
@@ -52,6 +61,8 @@ FIELD_LABELS = {
     "assigned_time": "assigned time",
     "deadline_date": "deadline date",
     "deadline_time": "deadline time",
+    "reminder_date": "reminder date",
+    "reminder_time": "reminder time",
     "status": "status",
     "progress": "progress",
 }
@@ -113,6 +124,193 @@ class StepResult:
     record: TaskRecord | None = None
 
 
+ORDINAL_WORDS = {
+    "first": 0,
+    "1st": 0,
+    "second": 1,
+    "2nd": 1,
+    "third": 2,
+    "3rd": 2,
+    "fourth": 3,
+    "4th": 3,
+    "fifth": 4,
+    "5th": 4,
+    "last": -1,
+    "latest": -1,
+    "previous": -1,
+    "prior": -1,
+}
+
+
+class TaskUpdateEngine:
+    """Pure state machine for the "change an existing task" conversation.
+
+    It never touches the database. It only resolves *which* of the candidate
+    tasks the employee picked, so the service can apply the change to exactly
+    one row.
+    """
+
+    def __init__(self, extractor=None, now: datetime | None = None,
+                 timezone: str | None = None):
+        self.extractor = extractor
+        self._fixed_now = now
+        self.timezone = timezone or getattr(config, "TIMEZONE", FALLBACK_TIMEZONE)
+
+    # ------------------------------------------------------------------ states
+
+    @staticmethod
+    def selection_draft(candidates: list, changes: dict, intent: str) -> dict:
+        """The state that is kept while the employee picks a task."""
+
+        return {
+            "intent": intent,
+            "candidates": [dict(candidate) for candidate in candidates],
+            "changes": dict(changes or {}),
+        }
+
+    @staticmethod
+    def pending_draft(
+        task_id: int | None,
+        changes: dict,
+        task: dict | None = None,
+        find: dict | None = None,
+        candidates: list | None = None,
+    ) -> dict:
+        """The state of an update that is waiting for a confirmation.
+
+        ``find`` keeps the search criteria of the conversation and
+        ``candidates`` the tasks that were already offered, so the next turn
+        can still work out which task is meant.
+        """
+
+        return {
+            "intent": "UPDATE_TASK",
+            "task_id": task_id,
+            "changes": dict(changes or {}),
+            "task": dict(task or {}),
+            "find": dict(find or {}),
+            "candidates": [dict(candidate) for candidate in (candidates or [])],
+        }
+
+    # --------------------------------------------------------------- selection
+
+    def resolve_selection(self, draft: dict, user_input: str) -> dict | None:
+        """Pick the task the employee meant.
+
+        Returns ``{"task_id": ..., "changes": ...}`` or ``None`` when the
+        message does not identify exactly one candidate.
+        """
+
+        draft = draft or {}
+        candidates = draft.get("candidates") or []
+        changes = draft.get("changes") or {}
+        text = (user_input or "").strip().lower()
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return {"task_id": candidates[0].get("id"), "changes": changes}
+
+        by_id = self._match_by_id(candidates, text)
+        if by_id is not None:
+            return {"task_id": by_id, "changes": changes}
+
+        by_ordinal = self._match_by_ordinal(candidates, text)
+        if by_ordinal is not None:
+            return {"task_id": by_ordinal, "changes": changes}
+
+        by_title = self._match_by_title(candidates, text)
+        if by_title is not None:
+            return {"task_id": by_title, "changes": changes}
+
+        return None
+
+    @staticmethod
+    def _match_by_id(candidates: list, text: str) -> int | None:
+        match = re.search(r"(?:#|task\s*#?\s*|id\s*#?\s*)(\d+)", text)
+        if not match:
+            return None
+
+        wanted = int(match.group(1))
+
+        for candidate in candidates:
+            if candidate.get("id") == wanted:
+                return wanted
+
+        return None
+
+    @staticmethod
+    def _match_by_ordinal(candidates: list, text: str) -> int | None:
+        words = re.findall(r"[a-z0-9]+", text)
+
+        for word in words:
+            index = ORDINAL_WORDS.get(word)
+
+            if index is None and word.isdigit():
+                number = int(word)
+                if 1 <= number <= len(candidates):
+                    index = number - 1
+
+            if index is None:
+                continue
+
+            if index == -1:
+                index = len(candidates) - 1
+
+            if 0 <= index < len(candidates):
+                return candidates[index].get("id")
+
+        return None
+
+    @staticmethod
+    def _match_by_title(candidates: list, text: str) -> int | None:
+        # An exact mention of the whole title is the strongest signal.
+        matches = [
+            candidate
+            for candidate in candidates
+            if (candidate.get("task_title") or "").strip().lower() in text
+            and (candidate.get("task_title") or "").strip()
+        ]
+
+        if len(matches) == 1:
+            return matches[0].get("id")
+
+        if len(matches) > 1:
+            return None
+
+        # Otherwise compare the meaningful concepts of the message with each
+        # title: "css task" still means "CSS designing", and "mcp" means
+        # "mcp server study". Generic words such as "task" are ignored.
+        scored = []
+        for candidate in candidates:
+            title = (candidate.get("task_title") or "").strip()
+            if not title:
+                continue
+
+            score, matched, total = task_search.match_score(title, text)
+
+            if not score or not total:
+                continue
+
+            if matched / total < 0.5:
+                continue
+
+            scored.append((score, candidate.get("id")))
+
+        if not scored:
+            return None
+
+        best_score = max(score for score, _ in scored)
+        winners = [task_id for score, task_id in scored if score == best_score]
+
+        # More than one equally good match is genuinely ambiguous.
+        if len(winners) == 1:
+            return winners[0]
+
+        return None
+
+
 class TaskDraftEngine:
     def __init__(self, extractor, now: datetime | None = None, timezone: str | None = None):
         self.extractor = extractor
@@ -158,15 +356,20 @@ class TaskDraftEngine:
         if questions:
             draft["_questions"] = questions
 
+        self._sync_status_progress(draft, {"status", "progress"})
+
         return self._next_step(draft)
 
     def apply(self, draft: dict, answers: dict | None) -> StepResult:
         draft = dict(draft or {})
         errors: list[str] = []
+        changed: set[str] = set()
 
         for name, raw_value in (answers or {}).items():
             if name not in FIELD_ORDER:
                 continue
+
+            changed.add(name)
 
             if raw_value is None or str(raw_value).strip() == "":
                 draft[name] = None  # explicit clearing (edit mode)
@@ -176,6 +379,8 @@ class TaskDraftEngine:
                 draft[name] = self._parse_field(name, str(raw_value).strip())
             except ValueError as error:
                 errors.append(f"{FIELD_LABELS[name]}: {error}")
+
+        self._sync_status_progress(draft, changed)
 
         rule_error = self._check_rules(draft)
         if rule_error:
@@ -193,6 +398,12 @@ class TaskDraftEngine:
 
         draft = dict(draft or {})
         target = self._first_missing(draft)
+
+        if target is None:
+            # Every field is already filled. Treat the reply as a correction
+            # (for example after a validation message) instead of re-running
+            # the same check with no new answers.
+            return self.edit(draft, user_input)
 
         extraction = self.extractor.extract_draft(user_input)
         answers = self._extraction_answers(
@@ -223,6 +434,16 @@ class TaskDraftEngine:
         )
 
         if not answers:
+            # Fall back to the deterministic parsers so short replies such as
+            # "IN_PROGRESS" or "40 percent" still update the draft.
+            status = self._status_from_text(user_input)
+            progress = self._progress_from_text(user_input)
+            if status is not None:
+                answers["status"] = status
+            if progress is not None:
+                answers["progress"] = progress
+
+        if not answers:
             return self._next_step(
                 draft,
                 errors=[
@@ -242,6 +463,8 @@ class TaskDraftEngine:
                 draft=draft,
                 message="Review the details, edit if needed, then confirm.",
             )
+
+        self._sync_status_progress(draft, {"status", "progress"})
 
         rule_error = self._check_rules(draft)
         if rule_error:
@@ -517,6 +740,17 @@ class TaskDraftEngine:
             raise ValueError(result.error or "invalid time.")
 
         raise ValueError("could not understand the time. Try '17:30' or '5 PM'.")
+
+    @staticmethod
+    def _sync_status_progress(draft: dict, changed: set[str]) -> None:
+        status, progress = sync_status_progress(
+            draft.get("status"),
+            draft.get("progress"),
+            status_changed="status" in changed,
+            progress_changed="progress" in changed,
+        )
+        draft["status"] = status
+        draft["progress"] = progress
 
     @staticmethod
     def _check_rules(draft: dict) -> str | None:

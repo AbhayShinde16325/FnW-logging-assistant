@@ -18,6 +18,7 @@ from ai.query_session import (
     STAGE_FIELDS,
     STAGE_REMINDER,
     TaskDraftEngine,
+    TaskUpdateEngine,
 )
 from ai.text_extractor import ExtractionResult, TaskRecord
 
@@ -118,15 +119,72 @@ def test_invalid_status_answer_is_rejected():
     assert "must be PENDING" in result.question
 
 
-def test_business_rule_violation_is_surfaced():
+def test_completed_status_syncs_progress_to_100():
     engine_ = engine(full_extraction())
     result = engine_.start("input")
     result = engine_.apply(
         result.draft, {"status": "COMPLETED", "progress": 40}
     )
 
-    assert result.stage == STAGE_FIELDS
-    assert "100%" in result.question
+    assert result.stage == STAGE_CONFIRM_FIELDS
+    assert result.draft["status"] == "COMPLETED"
+    assert result.draft["progress"] == 100
+
+
+def test_pending_status_with_progress_syncs_to_in_progress():
+    engine_ = engine(full_extraction())
+    result = engine_.start("input")
+    result = engine_.apply(
+        result.draft, {"status": "PENDING", "progress": 50}
+    )
+
+    assert result.stage == STAGE_CONFIRM_FIELDS
+    assert result.draft["status"] == "IN_PROGRESS"
+    assert result.draft["progress"] == 50
+
+
+def test_single_shot_validation_uses_the_same_sync_rule():
+    from ai.text_extractor import TaskDetails, validate_business_rules
+
+    task = TaskDetails(task_title="Python API research", status="PENDING", progress=50)
+    validate_business_rules(task)
+    assert task.status == "IN_PROGRESS"
+    assert task.progress == 50
+
+    task = TaskDetails(task_title="Python API research", status="COMPLETED", progress=40)
+    validate_business_rules(task)
+    assert task.status == "COMPLETED"
+    assert task.progress == 100
+
+
+class EmptyExtractor:
+    def extract_draft(self, user_input: str) -> ExtractionResult:
+        return ExtractionResult()
+
+
+def test_all_fields_filled_correction_escapes_validation_loop():
+    engine_ = TaskDraftEngine(extractor=EmptyExtractor(), now=NOW)
+    draft = engine(full_extraction()).start("input").draft
+    draft["status"] = "PENDING"
+
+    result = engine_.answer(
+        draft, "the status is in progress and the progress is 40 percent"
+    )
+
+    assert result.stage == STAGE_CONFIRM_FIELDS
+    assert result.draft["status"] == "IN_PROGRESS"
+    assert result.draft["progress"] == 40
+
+
+def test_all_fields_filled_accepts_bare_status_reply():
+    engine_ = TaskDraftEngine(extractor=EmptyExtractor(), now=NOW)
+    draft = engine(full_extraction()).start("input").draft
+    draft["status"] = "PENDING"
+
+    result = engine_.answer(draft, "IN_PROGRESS")
+
+    assert result.stage == STAGE_CONFIRM_FIELDS
+    assert result.draft["status"] == "IN_PROGRESS"
 
 
 def test_vague_date_answer_resolves_via_resolver():
@@ -281,3 +339,49 @@ def test_draft_is_json_serialisable():
     # must survive a stateless echo round-trip
     payload = json.dumps(result.draft)
     assert json.loads(payload) == result.draft
+
+
+# --- update task selection -----------------------------------------------------
+
+
+SELECTION_DRAFT = {
+    "intent": "UPDATE_TASK",
+    "candidates": [
+        {"id": 2460, "task_title": "mcp server study"},
+        {"id": 2461, "task_title": "I want to add a new task"},
+        {"id": 2462, "task_title": "CSS designing"},
+    ],
+    "changes": {"deadline_date": "2026-12-03"},
+}
+
+
+def test_selection_understands_a_short_title_reference():
+    engine_ = TaskUpdateEngine(now=NOW)
+
+    selection = engine_.resolve_selection(SELECTION_DRAFT, "css task")
+
+    assert selection == {
+        "task_id": 2462,
+        "changes": {"deadline_date": "2026-12-03"},
+    }
+
+
+def test_selection_does_not_pick_a_task_for_generic_words():
+    engine_ = TaskUpdateEngine(now=NOW)
+
+    assert engine_.resolve_selection(SELECTION_DRAFT, "the task") is None
+    assert engine_.resolve_selection(SELECTION_DRAFT, "my task") is None
+
+
+def test_selection_reports_equally_good_matches_as_ambiguous():
+    engine_ = TaskUpdateEngine(now=NOW)
+    draft = {
+        "intent": "UPDATE_TASK",
+        "candidates": [
+            {"id": 1, "task_title": "html and css learning"},
+            {"id": 2, "task_title": "CSS designing"},
+        ],
+        "changes": {},
+    }
+
+    assert engine_.resolve_selection(draft, "css task") is None
