@@ -4,6 +4,7 @@ import {
   API_BASE as API,
   authErrorMessage,
   beginGoogleLogin,
+  bootstrapCsrfToken,
   clearCsrfToken,
   logoutRequest,
   refreshSessionRequest,
@@ -460,6 +461,12 @@ function App() {
       };
 
       try {
+        try {
+          await bootstrapCsrfToken();
+        } catch {
+          return applySignedOut("Unable to reach the authentication service.");
+        }
+
         for (let attempt = 0; attempt < 2; attempt += 1) {
           const result = await refreshSessionRequest();
 
@@ -477,7 +484,11 @@ function App() {
             continue;
           }
 
-          if (/unable to reach|network/i.test(detail)) {
+          if (result?.status === 403) {
+            return applySignedOut();
+          }
+
+          if (/unable to reach|network|initialize the session/i.test(detail)) {
             return applySignedOut("Unable to reach the authentication service.");
           }
 

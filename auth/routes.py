@@ -91,6 +91,17 @@ def _csrf_error() -> HTTPException:
     )
 
 
+def _issue_csrf_cookie(response: Response, settings) -> str:
+    csrf_token = random_token(32)
+    response.set_cookie(
+        settings.csrf_cookie_name,
+        csrf_token,
+        max_age=settings.refresh_token_days * 24 * 60 * 60,
+        **_cookie_options(settings, httponly=False),
+    )
+    return csrf_token
+
+
 def _check_csrf(request: Request, settings) -> None:
     cookie_value = request.cookies.get(settings.csrf_cookie_name)
     header_value = request.headers.get("X-CSRF-Token")
@@ -307,6 +318,13 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     )
 
     return response
+
+
+@router.get("/csrf")
+def csrf_bootstrap(response: Response):
+    settings = auth_config.settings
+    csrf_token = _issue_csrf_cookie(response, settings)
+    return {"csrf_token": csrf_token}
 
 
 @router.post("/refresh")

@@ -6,6 +6,7 @@ const API = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").repla
 export const API_BASE = API;
 export const AUTH_ME_API = `${API}/auth/me`;
 export const AUTH_REFRESH_API = `${API}/auth/refresh`;
+export const AUTH_CSRF_API = `${API}/auth/csrf`;
 export const AUTH_LOGIN_API = `${API}/auth/google/login`;
 export const AUTH_LOGOUT_API = `${API}/auth/logout`;
 export const AUTH_LOGOUT_ALL_API = `${API}/auth/logout-all`;
@@ -52,13 +53,51 @@ export function beginGoogleLogin(returnTo = window.location.href) {
 
 const REFRESH_LOCK_NAME = "taskflow-refresh-session";
 
-async function postRefreshRequest() {
-  const response = await fetch(AUTH_REFRESH_API, {
-    method: "POST",
+export async function bootstrapCsrfToken() {
+  const response = await fetch(AUTH_CSRF_API, {
+    method: "GET",
     credentials: "include",
-    headers: csrfHeaders(),
   });
   const data = await response.json().catch(() => ({}));
+
+  if (response.ok && data?.csrf_token) {
+    setCsrfToken(data.csrf_token);
+    return data.csrf_token;
+  }
+
+  throw new Error(data?.detail || "Unable to initialize the session.");
+}
+
+async function postRefreshRequest() {
+  const doRefresh = () =>
+    fetch(AUTH_REFRESH_API, {
+      method: "POST",
+      credentials: "include",
+      headers: csrfHeaders(),
+    });
+
+  let response = await doRefresh();
+  let data = await response.json().catch(() => ({}));
+
+  // After a full-page OAuth redirect the CSRF cookie may exist but the
+  // in-memory token and cross-origin cookie read are unavailable. Bootstrap a
+  // fresh CSRF token once, then retry the refresh.
+  if (
+    response.status === 403 &&
+    /could not be verified/i.test(String(data?.detail || ""))
+  ) {
+    try {
+      await bootstrapCsrfToken();
+      response = await doRefresh();
+      data = await response.json().catch(() => ({}));
+    } catch {
+      return {
+        ok: false,
+        status: 403,
+        data: { detail: "The request could not be verified." },
+      };
+    }
+  }
 
   if (response.ok && data?.csrf_token) {
     setCsrfToken(data.csrf_token);

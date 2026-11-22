@@ -854,3 +854,183 @@ def test_agent_blocks_write_without_the_required_permission():
     assert result["status"] == "error"
     assert "permission" in result["message"]
     assert called == []
+
+def test_csrf_bootstrap_sets_cookie_and_returns_token(auth_client):
+    client, settings = auth_client
+
+    response = client.get("/auth/csrf")
+
+    assert response.status_code == 200
+    token = response.json().get("csrf_token")
+    assert token
+    assert client.cookies.get(settings.csrf_cookie_name) == token
+    set_cookie = "; ".join(response.headers.get_list("set-cookie"))
+    assert settings.csrf_cookie_name in set_cookie
+    assert "Path=/" in set_cookie
+    assert "httponly" not in set_cookie.lower()
+    assert "samesite=lax" in set_cookie.lower()
+
+
+def test_csrf_bootstrap_cookie_attributes_for_render(auth_client, monkeypatch):
+    client, settings = auth_client
+    secure_settings = make_settings(cookie_secure=True, cookie_same_site="none")
+    monkeypatch.setattr(auth_config, "settings", secure_settings)
+    monkeypatch.setattr(auth_routes, "auth_config", auth_config)
+
+    response = client.get("/auth/csrf")
+
+    assert response.status_code == 200
+    set_cookie = "; ".join(response.headers.get_list("set-cookie"))
+    assert "Secure" in set_cookie
+    assert "samesite=none" in set_cookie.lower()
+    assert "Path=/" in set_cookie
+    assert "Domain=" not in set_cookie
+
+
+def test_refresh_after_oauth_redirect_with_csrf_bootstrap(auth_client, monkeypatch):
+    client, settings = auth_client
+    state, _ = _start_google_login(client, settings, return_to="/tasks")
+
+    monkeypatch.setattr(auth_routes, "exchange_code", lambda **kwargs: {"id_token": "google-id-token"})
+    monkeypatch.setattr(
+        auth_routes,
+        "verify_id_token",
+        lambda **kwargs: {"sub": "sub-1", "email": "rahul@example.com", "name": "Rahul"},
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "find_or_link_google_employee",
+        lambda **kwargs: SimpleNamespace(id=7, email="rahul@example.com"),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "create_session",
+        lambda *args, **kwargs: ("refresh-token", SimpleNamespace(id="session-1", employee_id=7)),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "rotate_refresh_session",
+        lambda *args, **kwargs: ("refresh-token-2", SimpleNamespace(id="session-1", employee_id=7)),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "employee_for_session",
+        lambda *args, **kwargs: employee([TASKS_READ], employee_id=7, name="Rahul"),
+    )
+
+    callback = client.get(f"/auth/google/callback?code=test-code&state={state}", follow_redirects=False)
+    assert callback.status_code == 302
+
+    # Simulate full-page redirect: browser loses in-memory CSRF, but can
+    # bootstrap from same-origin/proxied endpoint before refresh.
+    bootstrap = client.get("/auth/csrf")
+    assert bootstrap.status_code == 200
+    csrf_token = bootstrap.json()["csrf_token"]
+    refresh = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf_token})
+
+    assert refresh.status_code == 200, refresh.text
+    assert refresh.json()["employee"]["email"] == "employee-7@example.com"
+
+
+def test_refresh_rejects_missing_csrf_token(auth_client):
+    client, settings = auth_client
+    client.cookies.set(settings.refresh_cookie_name, "refresh-token")
+    client.cookies.set(settings.csrf_cookie_name, "csrf-cookie")
+
+    response = client.post("/auth/refresh")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "The request could not be verified."
+
+
+def test_refresh_rejects_invalid_refresh_token_with_valid_csrf(auth_client, monkeypatch):
+    client, settings = auth_client
+    client.cookies.set(settings.refresh_cookie_name, "bad-refresh")
+    client.cookies.set(settings.csrf_cookie_name, "csrf-cookie")
+    monkeypatch.setattr(
+        auth_routes,
+        "rotate_refresh_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(auth_routes.AuthenticationError("bad")),
+    )
+
+    response = client.post("/auth/refresh", headers={"X-CSRF-Token": "csrf-cookie"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "The session has expired."
+
+
+def test_callback_rejects_unprovisioned_google_account(auth_client, monkeypatch):
+    client, settings = auth_client
+    state, _ = _start_google_login(client, settings)
+
+    monkeypatch.setattr(auth_routes, "exchange_code", lambda **kwargs: {"id_token": "google-id-token"})
+    monkeypatch.setattr(
+        auth_routes,
+        "verify_id_token",
+        lambda **kwargs: {"sub": "sub-1", "email": "nobody@example.com", "name": "Nobody"},
+    )
+    monkeypatch.setattr(auth_routes, "find_or_link_google_employee", lambda **kwargs: None)
+
+    response = client.get(
+        f"/auth/google/callback?code=test-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert "auth_error=not_provisioned" in response.headers["location"]
+
+
+def test_callback_accepts_existing_google_account_match(auth_client, monkeypatch):
+    client, settings = auth_client
+    state, _ = _start_google_login(client, settings)
+    seen = {}
+
+    monkeypatch.setattr(auth_routes, "exchange_code", lambda **kwargs: {"id_token": "google-id-token"})
+    monkeypatch.setattr(
+        auth_routes,
+        "verify_id_token",
+        lambda **kwargs: {"sub": "sub-1", "email": "rahul@example.com", "name": "Rahul"},
+    )
+
+    def _find(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(id=7)
+
+    monkeypatch.setattr(auth_routes, "find_or_link_google_employee", _find)
+    monkeypatch.setattr(
+        auth_routes,
+        "create_session",
+        lambda *args, **kwargs: ("refresh-token", SimpleNamespace(id="session-1")),
+    )
+
+    response = client.get(
+        f"/auth/google/callback?code=test-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert seen["google_sub"] == "sub-1"
+    assert seen["email"] == "rahul@example.com"
+
+
+def test_cors_allows_configured_origin_with_credentials():
+    from app import CORS_ORIGINS, app
+
+    client = TestClient(app)
+    origin = CORS_ORIGINS[0]
+
+    response = client.get(
+        "/auth/csrf",
+        headers={"Origin": origin},
+    )
+
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == origin
+    assert response.headers.get("access-control-allow-credentials") == "true"
+
+    blocked = client.get(
+        "/auth/csrf",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert blocked.status_code == 200
+    assert blocked.headers.get("access-control-allow-origin") is None
