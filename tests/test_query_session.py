@@ -40,6 +40,7 @@ def full_extraction() -> ExtractionResult:
     """Everything stated explicitly except the status."""
     return ExtractionResult(
         task_title="Python API research",
+        task_description="Summarise the API findings",
         assigned_to="Rahul",
         assigned_when="10 November 2026 at 10:30 AM",
         deadline_when="15 November 2026 at 5 PM",
@@ -52,6 +53,7 @@ def full_extraction() -> ExtractionResult:
 def vague_extraction() -> ExtractionResult:
     return ExtractionResult(
         task_title="Testing",
+        task_description="Regression test plan",
         assigned_to="Rohan",
         assigned_when=None,
         deadline_when="tomorrow",
@@ -83,11 +85,11 @@ def test_start_resolves_explicit_phrases():
     assert draft["assigned_time"] == "10:30"
     assert draft["deadline_date"] == "2026-11-15"
     assert draft["deadline_time"] == "17:00"
+    assert draft["task_description"] == "Summarise the API findings"
     assert draft["progress"] == 50
-    # status was not stated
-    assert result.stage == STAGE_FIELDS
-    assert result.missing_fields == ["status"]
-    assert "status" in result.question.lower()
+    # status and progress are optional defaults
+    assert result.stage == STAGE_CONFIRM_FIELDS
+    assert result.missing_fields == []
 
 
 def test_start_resolves_vague_deadline_partially():
@@ -97,9 +99,8 @@ def test_start_resolves_vague_deadline_partially():
     draft = result.draft
     assert draft["deadline_date"] == "2026-11-13"  # tomorrow, frozen clock
     assert draft["deadline_time"] is None
-    assert set(result.missing_fields) >= {
-        "assigned_date", "assigned_time", "deadline_time", "status", "progress"
-    }
+    assert result.missing_fields == ["deadline_time"]
+    assert "time" in result.question.lower()
 
 
 def test_apply_answers_completes_phase_a():
@@ -227,9 +228,52 @@ def test_edit_at_confirmation_stage():
     assert result.draft["progress"] == 80
 
 
+def test_missing_description_is_asked_before_optional_fields():
+    extraction = full_extraction()
+    extraction.task_description = None
+    result = engine(extraction).start("input")
+
+    assert result.stage == STAGE_FIELDS
+    assert result.missing_fields == ["task_description"]
+    assert "expected outcome" in result.question.lower()
+
+
+def test_required_fields_are_configurable(monkeypatch):
+    monkeypatch.setenv("TASK_REQUIRED_FIELDS", "task_title,assigned_to")
+    extraction = full_extraction()
+    extraction.task_description = None
+    extraction.deadline_when = None
+
+    result = engine(extraction).start("input")
+
+    assert result.missing_fields == []
+    assert result.stage == STAGE_CONFIRM_FIELDS
+
+
+def test_optional_fields_are_defaulted_on_save():
+    extraction = ExtractionResult(
+        task_title="Minimal task",
+        task_description="Only the required fields",
+        assigned_to="Rahul",
+        deadline_when="15 November 2026 at 5 PM",
+    )
+
+    result = engine(extraction).start("input")
+
+    assert result.stage == STAGE_CONFIRM_FIELDS
+    result = engine(extraction).confirm_fields(result.draft, confirm=True)
+    assert result.stage == STAGE_REMINDER
+    result = engine(extraction).skip_reminder(result.draft)
+    assert result.stage == STAGE_DONE
+    assert result.record.status == "PENDING"
+    assert result.record.progress == 0
+    assert result.record.assigned_date is None
+    assert result.record.reminder_date is None
+
+
 # --- Phase B (reminder) ----------------------------------------------------------
 
-def test_confirm_fields_without_reminder_phrase_asks():
+def test_confirm_fields_without_reminder_phrase_asks_for_reminder():
     engine_ = engine(full_extraction())
     result = engine_.start("input")
     result = engine_.apply(result.draft, {"status": "IN_PROGRESS"})
@@ -237,6 +281,30 @@ def test_confirm_fields_without_reminder_phrase_asks():
 
     assert result.stage == STAGE_REMINDER
     assert result.question
+    assert "no reminder" in result.question.lower()
+
+
+def test_explicitly_declined_reminder_is_optional():
+    engine_ = engine(full_extraction())
+    result = engine_.start("input")
+    result = engine_.apply(result.draft, {"status": "IN_PROGRESS"})
+    result = engine_.confirm_fields(result.draft, confirm=True)
+    result = engine_.set_reminder(result.draft, "not required")
+
+    assert result.stage == STAGE_DONE
+    assert result.done
+    assert result.record.reminder_date is None
+    assert result.record.reminder_time is None
+
+
+def test_declining_reminder_at_start_skips_the_question():
+    engine_ = engine(full_extraction())
+    result = engine_.start("no reminder needed")
+    result = engine_.apply(result.draft, {"status": "IN_PROGRESS"})
+    result = engine_.confirm_fields(result.draft, confirm=True)
+
+    assert result.stage == STAGE_DONE
+    assert result.record.reminder_date is None
 
 
 def test_prefilled_reminder_phrase_is_resolved_and_confirmed():

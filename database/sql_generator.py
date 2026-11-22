@@ -57,11 +57,14 @@ DATE_COLUMNS = frozenset(
 TIME_COLUMNS = frozenset(
     {"assigned_time", "deadline_time", "reminder_time"}
 )
-TEXT_COLUMNS = frozenset({"task_title", "assigned_to", "status"})
+TEXT_COLUMNS = frozenset(
+    {"task_title", "task_description", "assigned_to", "status"}
+)
 INTEGER_COLUMNS = frozenset({"progress"})
 
 COLUMN_ORDER = (
     "task_title",
+    "task_description",
     "assigned_to",
     "assigned_date",
     "assigned_time",
@@ -120,8 +123,8 @@ def _validate_value(column: str, value):
     if not isinstance(value, str):
         raise OperationError(f"{column} must be text.")
 
-    if column == "task_title" and not value.strip():
-        raise OperationError("task_title cannot be empty.")
+    if column in {"task_title", "task_description"} and not value.strip():
+        raise OperationError(f"{column} cannot be empty.")
 
     return value
 
@@ -197,9 +200,9 @@ def build_update_operation(
 
     sql = (
         f"UPDATE {TASK_TABLE} SET {assignments} WHERE {where} "
-        "RETURNING id, task_title, assigned_to, assigned_date, assigned_time, "
-        "deadline_date, deadline_time, reminder_date, reminder_time, "
-        "status, progress"
+        "RETURNING id, task_title, task_description, assigned_to, "
+        "assigned_date, assigned_time, deadline_date, deadline_time, "
+        "reminder_date, reminder_time, status, progress"
     )
 
     return {
@@ -292,9 +295,9 @@ def build_select_operation(
             params["title_contains"] = f"%{title_contains.strip()}%"
 
     sql = (
-        "SELECT id, task_title, assigned_to, assigned_date, assigned_time, "
-        "deadline_date, deadline_time, reminder_date, reminder_time, "
-        "status, progress FROM tasks"
+        "SELECT id, task_title, task_description, assigned_to, "
+        "assigned_date, assigned_time, deadline_date, deadline_time, "
+        "reminder_date, reminder_time, status, progress FROM tasks"
     )
 
     if conditions:

@@ -108,10 +108,133 @@ def test_the_agent_reads_rows_with_a_generated_query():
     assert result["status"] == "success"
     assert result["intent"] == "GET_TASK"
     assert result["task"]["id"] == 7
-    assert result["reply"] == "The task title is Business report."
+    assert result["requested_field"] == "task_title"
+    assert result["reply"] == "Business report"
     assert result["planner"] == "llm_agent"
     assert result["agent"]["tools"][0]["tool"] == "execute_read_query"
     assert executor.calls[0]["params"] == {"owner": "Rahul"}
+
+
+def test_a_single_requested_field_drops_model_narration_and_control_tokens():
+    rows = [
+        {
+            "id": 11,
+            "task_title": "Release report",
+            "task_description": "Confirmed deployment summary",
+            "assigned_to": "Rahul",
+        }
+    ]
+    executor = read_executor(rows)
+    client = ScriptedClient(
+        [
+            tool_turn(
+                "execute_read_query",
+                {
+                    "sql": (
+                        "SELECT id, task_title, task_description, assigned_to "
+                        "FROM tasks WHERE assigned_to ILIKE :owner"
+                    ),
+                    "params": {"owner": "Rahul"},
+                },
+            ),
+            AssistantTurn(
+                content=(
+                    '<EOS_TOKEN>The task description is "Confirmed deployment '
+                    'summary". I should answer with just the description as '
+                    "per the rules.Confirmed deployment summary"
+                )
+            ),
+        ]
+    )
+
+    result = run_database_agent(
+        "What is its description?",
+        employee="Rahul",
+        client=client,
+        read_executor=executor,
+    )
+
+    assert result["status"] == "success"
+    assert result["requested_field"] == "task_description"
+    assert result["reply"] == "Confirmed deployment summary"
+    assert "<EOS_TOKEN>" not in result["reply"]
+
+
+def test_a_field_answered_from_memory_is_re_read_and_formatted(monkeypatch):
+    memory = {
+        "active_task_id": 13,
+        "context": {"active_task": {"id": 13, "task_title": "Release report"}},
+    }
+    monkeypatch.setattr(
+        database_agent.task_repository,
+        "get_task_for_owner",
+        lambda task_id, owner: {
+            "id": task_id,
+            "task_title": "Release report",
+            "task_description": "Fresh description from PostgreSQL",
+            "assigned_to": owner,
+        },
+    )
+    client = ScriptedClient(
+        [
+            AssistantTurn(
+                content=(
+                    "The user wants the description. "
+                    "The description is Fresh description from PostgreSQL."
+                )
+            )
+        ]
+    )
+
+    result = run_database_agent(
+        "What is its description?",
+        employee="Rahul",
+        memory=memory,
+        client=client,
+    )
+
+    assert result["status"] == "success"
+    assert result["requested_field"] == "task_description"
+    assert result["reply"] == "Fresh description from PostgreSQL"
+    assert result["agent"]["iterations"] == 1
+
+
+def test_a_multi_field_question_keeps_the_model_answer():
+    rows = [
+        {
+            "id": 12,
+            "task_title": "Release report",
+            "assigned_to": "Rahul",
+            "status": "IN_PROGRESS",
+            "progress": 40,
+        }
+    ]
+    executor = read_executor(rows)
+    client = ScriptedClient(
+        [
+            tool_turn(
+                "execute_read_query",
+                {
+                    "sql": (
+                        "SELECT id, task_title, assigned_to, status, progress "
+                        "FROM tasks WHERE assigned_to ILIKE :owner"
+                    ),
+                    "params": {"owner": "Rahul"},
+                },
+            ),
+            AssistantTurn(content="IN_PROGRESS at 40%."),
+        ]
+    )
+
+    result = run_database_agent(
+        "What are its status and progress?",
+        employee="Rahul",
+        client=client,
+        read_executor=executor,
+    )
+
+    assert result["reply"] == "IN_PROGRESS at 40%."
+    assert "requested_field" not in result
 
 
 def test_context_is_available_to_the_model_and_a_context_tool(monkeypatch):
@@ -486,3 +609,128 @@ def test_the_agent_is_disabled_without_the_flag(monkeypatch):
     monkeypatch.delenv("DATABASE_AGENT", raising=False)
 
     assert run_database_agent("show tasks") is None
+
+
+def test_tool_plan_is_internal_and_never_sent_back_to_the_provider():
+    executor = read_executor([{"id": 2, "assigned_to": "Rahul"}])
+    plan_turn = tool_turn(
+        "execute_read_query",
+        {"sql": "SELECT id, assigned_to FROM tasks", "params": {}},
+    )
+    plan_turn.tool_plan = "Private chain of thought"
+    client = ScriptedClient(
+        [plan_turn, AssistantTurn(content="Task 2 is yours.")]
+    )
+
+    result = run_database_agent(
+        "show tasks", employee="Rahul", client=client, read_executor=executor
+    )
+
+    assert result["status"] == "success"
+    second_request = client.calls[1]["messages"]
+
+    assert all("tool_plan" not in message for message in second_request)
+
+    assistant = next(
+        message for message in second_request if message["role"] == "assistant"
+    )
+    assert "content" not in assistant
+    assert assistant["tool_calls"][0]["id"] == "call-1"
+    assert assistant["tool_calls"][0]["type"] == "function"
+    assert assistant["tool_calls"][0]["function"]["name"] == "execute_read_query"
+
+
+def test_multiple_consecutive_tool_calls_keep_their_call_ids():
+    client = ScriptedClient(
+        [
+            AssistantTurn(
+                tool_calls=[
+                    ToolCall(
+                        id="call-a",
+                        name="inspect_database_schema",
+                        arguments={},
+                    ),
+                    ToolCall(
+                        id="",
+                        name="retrieve_conversation_context",
+                        arguments={},
+                    ),
+                ]
+            ),
+            AssistantTurn(content="I inspected the schema and context."),
+        ]
+    )
+
+    result = run_database_agent(
+        "what can you see?",
+        employee="Rahul",
+        conversation_id="conv-1",
+        client=client,
+    )
+
+    assert result["status"] == "success"
+    messages = client.calls[1]["messages"]
+    roles = [message["role"] for message in messages]
+    assistant_index = roles.index("assistant")
+    assistant = messages[assistant_index]
+    tool_messages = messages[assistant_index + 1 :]
+
+    assert len(assistant["tool_calls"]) == 2
+    assert [message["role"] for message in tool_messages] == ["tool", "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == [
+        "call-a",
+        assistant["tool_calls"][1]["id"],
+    ]
+    assert assistant["tool_calls"][1]["id"]
+    assert len(result["agent"]["tools"]) == 2
+
+
+def test_invalid_tool_arguments_are_rejected_before_execution():
+    client = ScriptedClient(
+        [
+            tool_turn(
+                "inspect_table_definition",
+                {"table": "tasks", "unexpected": "value"},
+            ),
+            AssistantTurn(content="I need to correct the tool call."),
+        ]
+    )
+
+    result = run_database_agent("inspect tasks", client=client)
+
+    assert result["status"] == "success"
+    assert result["agent"]["tools"][0]["status"] == "error"
+    assert "Unknown tool argument" in result["agent"]["tools"][0]["message"]
+
+
+class _ProviderBadRequest(Exception):
+    status_code = 400
+    headers = {"x-debug-trace-id": "trace-123"}
+    body = {"message": "tool plan cannot be used with this model"}
+
+
+class _FailingProviderClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, *, messages, tools):
+        self.calls += 1
+        raise _ProviderBadRequest("invalid request")
+
+
+def test_provider_failure_is_not_reported_as_success_and_is_not_retried():
+    client = _FailingProviderClient()
+
+    result = run_database_agent(
+        "show tasks",
+        employee="Rahul",
+        conversation_id="conv-123",
+        client=client,
+    )
+
+    assert client.calls == 1
+    assert result["status"] == "error"
+    assert result["error_category"] == "invalid_request"
+    assert result["agent"]["error_category"] == "invalid_request"
+    assert result["agent"]["provider_trace_id"] == "trace-123"
+    assert "rejected" in result["reply"]

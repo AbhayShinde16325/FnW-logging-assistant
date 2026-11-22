@@ -49,9 +49,16 @@ def client(monkeypatch):
         lambda record: {
             "id": 1,
             "task_title": record.task_title,
+            "task_description": record.task_description,
             "status": record.status,
-            "reminder_date": str(record.reminder_date),
-            "reminder_time": record.reminder_time.strftime("%H:%M"),
+            "reminder_date": (
+                str(record.reminder_date) if record.reminder_date else None
+            ),
+            "reminder_time": (
+                record.reminder_time.strftime("%H:%M")
+                if record.reminder_time
+                else None
+            ),
         },
     )
 
@@ -68,16 +75,17 @@ def voice_turn(client, state=None):
 
 def test_voice_turn_completes_two_way_flow(client):
     app_module.transcribe_audio = ScriptedTranscriber(
-        ["some task", "IN_PROGRESS", "yes", "30 minutes before the deadline", "yes"]
+        ["some task", "IN_PROGRESS", "yes", "no reminder"]
     )
 
     response = voice_turn(client)
     assert response.status_code == 200
     body = response.json()
-    assert body["reply"] == "What is the status?"
+    assert "Here is what I have so far" in body["reply"]
     first = body["result"]
-    assert first["status"] == "clarification_required"
-    assert first["missing_fields"] == ["status"]
+    assert first["status"] == "confirmation_required"
+    assert first["missing_fields"] == []
+    assert first["draft"]["task_description"] == "Summarise the API findings"
 
     response = voice_turn(
         client, {"stage": first["stage"], "draft": first["draft"]}
@@ -85,24 +93,17 @@ def test_voice_turn_completes_two_way_flow(client):
     assert response.status_code == 200
     second = response.json()["result"]
     assert second["status"] == "confirmation_required"
+    assert second["draft"]["status"] == "IN_PROGRESS"
 
     response = voice_turn(
         client, {"stage": second["stage"], "draft": second["draft"]}
     )
     assert response.status_code == 200
-    third = response.json()["result"]
-    assert third["status"] == "reminder_required"
+    reminder = response.json()["result"]
+    assert reminder["status"] == "reminder_required"
 
     response = voice_turn(
-        client, {"stage": third["stage"], "draft": third["draft"]}
-    )
-    assert response.status_code == 200
-    fourth = response.json()["result"]
-    assert fourth["status"] == "reminder_confirmation_required"
-    assert fourth["reminder"]["time"] == "16:30"
-
-    response = voice_turn(
-        client, {"stage": fourth["stage"], "draft": fourth["draft"]}
+        client, {"stage": reminder["stage"], "draft": reminder["draft"]}
     )
     assert response.status_code == 200
     final = response.json()
@@ -133,4 +134,4 @@ def test_legacy_voice_route_still_starts_a_task(client):
     )
 
     assert response.status_code == 200
-    assert response.json()["result"]["status"] == "clarification_required"
+    assert response.json()["result"]["status"] == "confirmation_required"

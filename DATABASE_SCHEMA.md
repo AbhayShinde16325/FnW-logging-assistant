@@ -35,8 +35,14 @@ statement.
 - URL: `DATABASE_URL` from `.env`, e.g.
   `postgresql+psycopg://postgres:<password>@localhost:5432/fnw_task_logger`
 - Schema: default (`public`). No custom schema.
-- Tables are created by `Base.metadata.create_all()` in `create_tables()`.
-  There are no migrations and no foreign keys.
+- Schema changes are owned by Alembic (`alembic upgrade head`). The backend
+  container runs it before startup. `create_tables()` remains as a safe
+  bootstrap for local runs.
+- The task table is the only table the SQL generation skill may reference.
+  Auth, RBAC, session, conversation-memory, notification, and push-subscription
+  tables are application-internal and are accessed through the ORM only.
+- Foreign keys exist on the auth/RBAC/task-employee columns, but SQL generated
+  against `tasks` still never uses joins.
 
 ## Table: `tasks`
 
@@ -46,7 +52,10 @@ Mapped class: `database.models.Task`.
 | --------------- | --------------- | -------------------- | -------- | ----------- | ----------------------------------------- |
 | `id`            | `Integer`       | `integer`            | NOT NULL | autoincrement | Primary key, indexed (`ix_tasks_id`).     |
 | `task_title`    | `String`        | `varchar`            | NOT NULL | none        | Required. Use non-empty text.             |
-| `assigned_to`   | `String`        | `varchar`            | NULL     | none        | Person name or `NULL`.                    |
+| `task_description` | `String`     | `varchar`            | NULL     | none        | Description or expected outcome. Required by the progressive-create flow. |
+| `assigned_to`   | `String`        | `varchar`            | NULL     | none        | Legacy display name or `NULL`.            |
+| `created_by_employee_id` | `Integer` | `integer`     | NULL     | none        | FK to `employees.id`, `ON DELETE SET NULL`. |
+| `assigned_to_employee_id` | `Integer` | `integer`   | NULL     | none        | FK to `employees.id`, `ON DELETE SET NULL`. |
 | `assigned_date` | `Date`          | `date`               | NULL     | none        | `YYYY-MM-DD`.                             |
 | `assigned_time` | `Time`          | `time without time zone` | NULL | none    | `HH:MM` / `HH:MM:SS`.                      |
 | `deadline_date` | `Date`          | `date`               | NULL     | none        | `YYYY-MM-DD`.                             |
@@ -62,6 +71,8 @@ Mapped class: `database.models.Task`.
 
 - `status`: exactly `PENDING`, `IN_PROGRESS`, or `COMPLETED` (uppercase).
 - `progress`: integer `0..100`.
+- `task_description` is required for progressive task creation and is not
+  silently invented when the employee has not provided it.
 - `status = 'COMPLETED'` requires `progress = 100`.
 - `progress > 0` implies status must be `IN_PROGRESS` or `COMPLETED`, never
   `PENDING`.
@@ -69,6 +80,143 @@ Mapped class: `database.models.Task`.
   "now" and at or before the deadline. If either reminder part is `NULL`, the
   reminder is considered not set.
 - NULL means "not stated"; do not invent dates/times or substitute `CURRENT_DATE`.
+
+## Tables: authentication and RBAC
+
+These tables are application-internal. The SQL skill must not reference them.
+
+### `roles`
+
+| Column | Postgres type | Nullable | Notes |
+| --- | --- | --- | --- |
+| `id` | `integer` | NOT NULL | Primary key |
+| `name` | `varchar` | NOT NULL | Unique: `ADMIN`, `MANAGER`, or `EMPLOYEE` |
+| `description` | `varchar` | NULL | Human-readable purpose |
+
+### `permissions`
+
+| Column | Postgres type | Nullable | Notes |
+| --- | --- | --- | --- |
+| `id` | `integer` | NOT NULL | Primary key |
+| `name` | `varchar` | NOT NULL | Unique permission string |
+| `description` | `varchar` | NULL | Human-readable purpose |
+
+Canonical permissions: `tasks.create`, `tasks.read`, `tasks.read_all`,
+`tasks.update`, `tasks.update_all`, `tasks.delete`, `employees.read`,
+`employees.manage`, `roles.manage`, `reports.read`.
+
+| Role | Permissions |
+| --- | --- |
+| `ADMIN` | All canonical permissions |
+| `MANAGER` | All task permissions, `employees.read`, `employees.manage`, `reports.read` |
+| `EMPLOYEE` | `tasks.read`, `tasks.update` (assigned tasks and progress only) |
+
+### `role_permissions`
+
+Associates roles and permissions.
+
+| Column | Postgres type | Nullable | Notes |
+| --- | --- | --- | --- |
+| `role_id` | `integer` | NOT NULL | FK to `roles.id`, cascade delete |
+| `permission_id` | `integer` | NOT NULL | FK to `permissions.id`, cascade delete |
+
+Primary key: `(role_id, permission_id)`.
+
+### `employees`
+
+| Column | Postgres type | Nullable | Notes |
+| --- | --- | --- | --- |
+| `id` | `integer` | NOT NULL | Primary key |
+| `google_sub` | `varchar` | NULL | Unique Google subject, linked on first sign-in |
+| `name` | `varchar` | NOT NULL | Display name |
+| `email` | `varchar` | NOT NULL | Unique, lower-case verified Google email |
+| `role_id` | `integer` | NOT NULL | FK to `roles.id` |
+| `is_active` | `boolean` | NOT NULL | Inactive employees cannot sign in or refresh |
+| `timezone` | `varchar(64)` | NOT NULL | IANA timezone, default `Asia/Kolkata`; used to resolve reminder wall-clock time |
+| `created_at` | `timestamp` | NOT NULL | UTC |
+| `updated_at` | `timestamp` | NOT NULL | UTC |
+
+### `sessions`
+
+Stores one rotating refresh-token session. Only the SHA-256 hash of the
+refresh token is stored; the raw token exists only in the HttpOnly cookie.
+
+| Column | Postgres type | Nullable | Notes |
+| --- | --- | --- | --- |
+| `id` | `varchar` | NOT NULL | Primary key, random token |
+| `employee_id` | `integer` | NOT NULL | FK to `employees.id`, cascade delete |
+| `refresh_token_hash` | `varchar` | NOT NULL | Unique SHA-256 hash |
+| `expires_at` | `timestamp` | NOT NULL | UTC refresh expiry |
+| `revoked_at` | `timestamp` | NULL | Revocation/rotation marker |
+| `created_at` | `timestamp` | NOT NULL | UTC |
+| `last_used_at` | `timestamp` | NULL | UTC |
+| `user_agent` | `varchar` | NULL | Truncated client details |
+| `ip_address` | `varchar` | NULL | Best-effort client address |
+
+Reusing a revoked refresh token revokes every active session for that
+employee. Access tokens are signed JWTs and are never stored server-side.
+
+
+## Tables: reminders, notifications, and push
+
+These tables are application-internal. The SQL skill must not reference them.
+They are added by `0003_reminder_notifications` and are accessed through
+`services/notification_service.py` and `services/push_service.py`.
+
+### `notifications`
+
+One reminder/delivery row per employee and task. The row is visible in the
+in-app notification center even when push delivery fails or no device is
+registered.
+
+| Column | Postgres type | Nullable | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | `integer` | NOT NULL | autoincrement | Primary key, indexed |
+| `employee_id` | `integer` | NOT NULL | none | FK to `employees.id`, cascade delete, indexed |
+| `task_id` | `integer` | NOT NULL | none | FK to `tasks.id`, cascade delete, indexed |
+| `title` | `varchar(255)` | NOT NULL | none | Notification title |
+| `message` | `text` | NOT NULL | none | Notification body |
+| `notification_type` | `varchar(64)` | NOT NULL | `TASK_REMINDER` | e.g. `TASK_REMINDER`, `DEADLINE_APPROACHING`, `TASK_OVERDUE`, `TASK_ASSIGNED` |
+| `priority` | `varchar(16)` | NOT NULL | `NORMAL` | `LOW`, `NORMAL`, `HIGH`, `CRITICAL` (0004) |
+| `voice_text` | `text` | NULL | none | Foreground TTS announcement text (0004) |
+| `payload` | `jsonb`/`json` | NULL | `{}` | Structured metadata for UI/delivery (0004) |
+| `is_read` | `boolean` | NOT NULL | `false` | Self-only read marker |
+| `scheduled_at` | `timestamp` | NOT NULL | none | Naive UTC reminder instant, indexed |
+| `created_at` | `timestamp` | NOT NULL | now (UTC) | Row creation time |
+| `delivered_at` | `timestamp` | NULL | none | Last successful push delivery |
+| `delivery_status` | `varchar(32)` | NOT NULL | `PENDING` | `PENDING`, `PROCESSING`, `SENT`, `FAILED`, `CANCELLED` |
+| `retry_count` | `integer` | NOT NULL | `0` | Delivery attempts |
+| `next_retry_at` | `timestamp` | NULL | none | Backoff deadline, indexed |
+| `last_error` | `text` | NULL | none | Last bounded delivery error |
+| `locked_at` | `timestamp` | NULL | none | Worker claim time for stale-claim recovery |
+
+Unique key:
+`(employee_id, task_id, notification_type, scheduled_at)` named
+`uq_notifications_employee_task_type_scheduled`. It prevents duplicate
+reminders for the same task and reminder instant.
+
+### `push_subscriptions`
+
+One browser/device Web Push subscription, owned by one employee.
+
+| Column | Postgres type | Nullable | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | `integer` | NOT NULL | autoincrement | Primary key, indexed |
+| `employee_id` | `integer` | NOT NULL | none | FK to `employees.id`, cascade delete, indexed |
+| `endpoint` | `varchar(1024)` | NOT NULL | none | Globally unique push endpoint |
+| `p256dh_key` | `varchar(512)` | NOT NULL | none | Browser public key |
+| `auth_key` | `varchar(512)` | NOT NULL | none | Browser auth secret |
+| `device_name` | `varchar(255)` | NULL | none | Optional browser/device label |
+| `is_active` | `boolean` | NOT NULL | `true` | Expired subscriptions are deactivated |
+| `created_at` | `timestamp` | NOT NULL | now (UTC) | Registration time |
+| `updated_at` | `timestamp` | NOT NULL | now (UTC) | Last update time |
+| `last_used_at` | `timestamp` | NULL | none | Last delivery attempt |
+
+Unique key: `endpoint` (`uq_push_subscriptions_endpoint`).
+
+Reminder and subscription reads are always scoped to the authenticated
+employee id. A manager or administrator does not automatically see another
+employee's personal notifications or devices.
 
 ## Table: `conversation_memory`
 
@@ -86,19 +234,25 @@ backend.
 | ----------------- | --------------- | -------------------- | -------- | -------------------- | ------------------------------------------------------ |
 | `id`              | `Integer`       | `integer`            | NOT NULL | autoincrement        | Primary key, indexed (`ix_conversation_memory_id`).     |
 | `conversation_id` | `String`        | `varchar`            | NOT NULL | none                 | Identifies the conversation, indexed.                   |
-| `user_id`         | `String`        | `varchar`            | NOT NULL | none                 | Identifies the user, indexed.                           |
+| `user_id`         | `String`        | `varchar`            | NOT NULL | none                 | Identifies the user, indexed. Authenticated requests use `employee:<id>`. |
+| `employee_id`     | `Integer`       | `integer`            | NULL     | none                 | FK to `employees.id`, set from the authenticated actor. |
 | `active_task_id`  | `Integer`       | `integer`            | NULL     | none                 | The task the employee is working on, indexed.           |
 | `last_action`     | `String`        | `varchar`            | NULL     | none                 | The last action that was carried out successfully.      |
 | `context`         | `JSON`/`JSONB`  | `jsonb`              | NULL     | `{}`                 | Snapshot of the active task and the last turns.        |
+| `response_feedback` | `Boolean`     | `boolean`            | NULL     | `NULL`               | `TRUE` thumbs up, `FALSE` thumbs down, `NULL` no rating. |
 | `updated_at`      | `DateTime`      | `timestamp without time zone` | NOT NULL | now (UTC)  | Written on every change.                               |
 
 - `UNIQUE (user_id, conversation_id)` - there is exactly one memory per user
   and conversation (`uq_conversation_memory_user_conversation`).
+- Authenticated chat and voice turns set `user_id` to `employee:<employee id>`
+  and fill `employee_id` from the request-scoped actor. Client-supplied
+  `user_id` values are ignored when authentication is enabled.
 - The `context` column holds a small JSON structure, never a full transcript:
 
   ```json
   {
-    "active_task": {"id": 211, "task_title": "Business report", "assigned_to": "Rahul",
+    "active_task": {"id": 211, "task_title": "Business report",
+                    "task_description": "Monthly business report", "assigned_to": "Rahul",
                     "status": "IN_PROGRESS", "progress": 10, "deadline_date": "2026-11-21"},
     "history": [
       {"role": "user", "text": "...", "at": "2026-11-13T09:30:00"},
@@ -113,6 +267,10 @@ backend.
   }
   ```
 
+- `task_creation` holds the persisted progressive-create clarification:
+  `stage`, the collected `draft`, `missing_fields`, `last_question` and the
+  fields already collected. It survives a backend restart and is cleared once
+  the task is saved or the employee starts another operation.
 - The history keeps the last 10 messages, each with a UTC timestamp (`at`).
   It is read newest-first, limited to 10, then sent to the model in
   chronological order.
@@ -124,6 +282,9 @@ backend.
 - `clarification` keeps the stage and the draft of a waiting clarification.
   It is cleared together with `pending` after a successful operation or when
   the employee starts a different operation.
+- `response_feedback` stores the latest thumbs up (`TRUE`) or thumbs down
+  (`FALSE`) of the conversation. It is only changed by the feedback endpoint;
+  new messages and history updates never clear it.
 
 ### Verification queries
 
@@ -184,15 +345,18 @@ ORDER BY turn->>'at';
 9. Progress/status filters must use the canonical uppercase status values.
 10. An ownership scope is an exact, case-insensitive match
     (`assigned_to ILIKE :owner`, no wildcards), never a partial match.
+    The authenticated application additionally enforces ownership with
+    `assigned_to_employee_id`; display names are never the authorization
+    mechanism for signed-in employees.
 
 ## Common query templates
 
 All tasks (newest first):
 
 ```sql
-SELECT id, task_title, assigned_to, assigned_date, assigned_time,
-       deadline_date, deadline_time, reminder_date, reminder_time,
-       status, progress
+SELECT id, task_title, task_description, assigned_to, assigned_date,
+       assigned_time, deadline_date, deadline_time, reminder_date,
+       reminder_time, status, progress
 FROM tasks
 ORDER BY id DESC;
 ```
@@ -200,9 +364,9 @@ ORDER BY id DESC;
 Single task by id:
 
 ```sql
-SELECT id, task_title, assigned_to, assigned_date, assigned_time,
-       deadline_date, deadline_time, reminder_date, reminder_time,
-       status, progress
+SELECT id, task_title, task_description, assigned_to, assigned_date,
+       assigned_time, deadline_date, deadline_time, reminder_date,
+       reminder_time, status, progress
 FROM tasks
 WHERE id = $1;
 ```
@@ -272,11 +436,12 @@ Insert a task:
 
 ```sql
 INSERT INTO tasks (
-    task_title, assigned_to, assigned_date, assigned_time,
+    task_title, task_description, assigned_to, assigned_date, assigned_time,
     deadline_date, deadline_time, reminder_date, reminder_time,
     status, progress
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, task_title, reminder_date, reminder_time, status, progress;
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, task_title, task_description, reminder_date, reminder_time,
+          status, progress;
 ```
 
 Update progress/status by id:

@@ -1392,6 +1392,129 @@ def test_a_rewritten_read_query_reaches_the_existing_agent(
     assert all(turn.get("at") for turn in history)
 
 
+class ProgressiveCreateExtractor:
+    """Two replies: first missing the description, then filling it."""
+
+    def __init__(self, title: str):
+        self.title = title
+        self.extractions = [
+            ExtractionResult(
+                task_title=title,
+                assigned_to="Rahul",
+                deadline_when="15 November 2026 at 5 PM",
+                status=None,
+                progress=0,
+            ),
+            ExtractionResult(
+                task_description="A deployment checklist for the release"
+            ),
+        ]
+
+    def extract_draft(self, user_input: str) -> ExtractionResult:
+        return self.extractions.pop(0)
+
+    def extract_update(self, user_input: str) -> TaskUpdate:
+        raise AssertionError("extract_update was not expected.")
+
+
+@pytest.mark.skipif(not DB_AVAILABLE, reason="PostgreSQL is not available.")
+def test_a_pending_creation_survives_without_echoed_stage(
+    client, rewriter, monkeypatch
+):
+    user = f"user-{uuid.uuid4().hex[:8]}"
+    conversation = f"conversation-{uuid.uuid4().hex[:8]}"
+    marker = uuid.uuid4().hex[:8]
+    title = f"Release checklist {marker}"
+
+    monkeypatch.setattr(
+        task_service, "extractor", ProgressiveCreateExtractor(title)
+    )
+
+    first = client.post(
+        "/tasks/chat",
+        json={
+            "message": f"Create a task called {title} for Rahul due tomorrow at 5 PM",
+            "conversation_id": conversation,
+            "user_id": user,
+        },
+    ).json()
+
+    assert first["status"] == "clarification_required"
+    assert first["missing_fields"] == ["task_description"]
+
+    memory = get_conversation_memory(user, conversation)
+    assert memory["context"]["task_creation"]["stage"] == "fields"
+    assert memory["context"]["task_creation"]["draft"]["task_title"] == title
+
+    second = client.post(
+        "/tasks/chat",
+        json={
+            "message": "The expected outcome is a deployment checklist.",
+            "conversation_id": conversation,
+            "user_id": user,
+        },
+    ).json()
+
+    assert second["status"] == "confirmation_required"
+    assert second["stage"] == "confirm_fields"
+    assert (
+        second["draft"]["task_description"]
+        == "A deployment checklist for the release"
+    )
+
+    memory = get_conversation_memory(user, conversation)
+    assert memory["context"]["task_creation"]["stage"] == "confirm_fields"
+    assert (
+        memory["context"]["task_creation"]["draft"]["task_description"]
+        == "A deployment checklist for the release"
+    )
+
+    reminder = client.post(
+        "/tasks/chat",
+        json={
+            "message": "yes",
+            "conversation_id": conversation,
+            "user_id": user,
+        },
+    ).json()
+
+    assert reminder["status"] == "reminder_required"
+    assert reminder["stage"] == "reminder"
+
+    memory = get_conversation_memory(user, conversation)
+    assert memory["context"]["task_creation"]["stage"] == "reminder"
+
+    final = client.post(
+        "/tasks/chat",
+        json={
+            "message": "no reminder",
+            "conversation_id": conversation,
+            "user_id": user,
+        },
+    ).json()
+
+    assert final["status"] == "success"
+    assert final["intent"] == "CREATE_TASK"
+    assert final["task"]["task_description"] == (
+        "A deployment checklist for the release"
+    )
+
+    session = SessionLocal()
+    try:
+        count = (
+            session.query(Task)
+            .filter(Task.task_title == title)
+            .count()
+        )
+    finally:
+        session.close()
+
+    assert count == 1
+    assert get_conversation_memory(user, conversation)["context"][
+        "task_creation"
+    ] == {}
+
+
 class HallucinatingExtractor:
     """An extractor that invents a task id that is not in the message."""
 

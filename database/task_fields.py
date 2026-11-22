@@ -20,6 +20,9 @@ TASK_COLUMNS = frozenset(column.name for column in Task.__table__.columns)
 FIELD_COLUMNS = {
     "id": ("id",),
     "task_title": ("task_title",),
+    "task_description": ("task_description",),
+    "description": ("task_description",),
+    "expected_outcome": ("task_description",),
     "assigned_to": ("assigned_to",),
     "assigned_date": ("assigned_date",),
     "assigned_time": ("assigned_time",),
@@ -43,7 +46,9 @@ DATE_FIELDS = {
     "reminder",
 }
 TIME_FIELDS = {"assigned_time", "deadline_time", "reminder_time"}
-TEXT_FIELDS = {"id", "task_title", "assigned_to", "status"}
+TEXT_FIELDS = {
+    "id", "task_title", "task_description", "assigned_to", "status"
+}
 INTEGER_FIELDS = {"progress"}
 
 FULL_DETAILS = "full"
@@ -53,6 +58,9 @@ NULL_MESSAGES = {
     "status": "No status has been set for this task.",
     "assigned_to": "No assignee has been set for this task.",
     "task_title": "No title has been set for this task.",
+    "task_description": "No description has been set for this task.",
+    "description": "No description has been set for this task.",
+    "expected_outcome": "No description has been set for this task.",
     "assigned_date": "No assigned date has been set for this task.",
     "assigned_time": "No assigned time has been set for this task.",
     "assigned": "No assigned date has been set for this task.",
@@ -153,6 +161,13 @@ _ALIASES = (
         r"\bname\s+of\s+the\s+task\b",
         r"\bwhat\s+is\s+the\s+task\b",
     )),
+    ("task_description", (
+        r"\bdescription\b",
+        r"\bdescribed\b",
+        r"\bexpected\s+outcome\b",
+        r"\boutcome\b",
+        r"\bwhat\s+(?:needs|has)\s+to\s+be\s+done\b",
+    )),
     ("id", (
         r"\btask\s+id\b",
         r"\bid\s+number\b",
@@ -187,20 +202,54 @@ def normalize_field(field: str | None) -> str | None:
     return resolve_requested_field(text)
 
 
-def resolve_requested_field(text: str | None) -> str | None:
-    """The semantic field a message asks about, or ``None``."""
+def resolve_requested_fields(text: str | None) -> list[str]:
+    """Every distinct semantic field a message asks about, in alias order."""
 
     if not text:
-        return None
+        return []
 
     if _FULL_DETAILS_PATTERN.search(text):
-        return FULL_DETAILS
+        return [FULL_DETAILS]
+
+    fields = []
 
     for field, patterns in _COMPILED_ALIASES:
         if any(pattern.search(text) for pattern in patterns):
-            return field
+            fields.append(field)
 
-    return None
+    # A specific alias ("deadline date") also matches the generic alias
+    # ("deadline"). Keep only the specific fields so a single-field question
+    # is not mistaken for a multi-field one.
+    generic = {"assigned", "deadline", "reminder"}
+    specific = {
+        "assigned_to",
+        "assigned_date",
+        "assigned_time",
+        "deadline_date",
+        "deadline_time",
+        "reminder_date",
+        "reminder_time",
+    }
+
+    if any(field in specific for field in fields):
+        fields = [
+            field
+            for field in fields
+            if not (field in generic and any(
+                other.startswith(field)
+                for other in fields
+                if other in specific
+            ))
+        ]
+
+    return list(dict.fromkeys(fields))
+
+
+def resolve_requested_field(text: str | None) -> str | None:
+    """The first semantic field a message asks about, or ``None``."""
+
+    fields = resolve_requested_fields(text)
+    return fields[0] if fields else None
 
 
 def is_full_details_request(text: str | None) -> bool:
@@ -283,8 +332,15 @@ def format_field_value(field: str, task) -> str:
         value = _value(task, "status")
         return NULL_MESSAGES["status"] if value is None else str(value)
 
-    if normalized in ("task_title", "assigned_to", "id"):
-        value = _value(task, normalized)
+    if normalized in (
+        "task_title",
+        "task_description",
+        "description",
+        "expected_outcome",
+        "assigned_to",
+        "id",
+    ):
+        value = _value(task, _primary_column(normalized))
         return NULL_MESSAGES.get(normalized, "Not set.") if value is None else str(value)
 
     if normalized in DATE_FIELDS:

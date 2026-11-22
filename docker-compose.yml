@@ -32,7 +32,22 @@ services:
     environment:
       # The database host is the compose service name, not localhost.
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-fnw_task_logger}
+      AI_PROVIDER: ${AI_PROVIDER:-cohere}
       COHERE_API_KEY: ${COHERE_API_KEY:?Set COHERE_API_KEY in .env}
+      MCP_ENABLED: ${MCP_ENABLED:-1}
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-streamable-http}
+      MCP_SERVER_NAME: ${MCP_SERVER_NAME:-fnw-task-manager}
+      MCP_PATH: ${MCP_PATH:-/mcp}
+      MCP_REQUIRE_AUTH: ${MCP_REQUIRE_AUTH:-1}
+      # In-container MCP server URL used by the backend's MCP client adapter.
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-http://127.0.0.1:8000/mcp/}
+      MCP_STATELESS: ${MCP_STATELESS:-1}
+      MCP_JSON_RESPONSE: ${MCP_JSON_RESPONSE:-1}
+      MCP_TOOL_CACHE_SECONDS: ${MCP_TOOL_CACHE_SECONDS:-300}
+      MCP_SESSION_IDLE_TIMEOUT: ${MCP_SESSION_IDLE_TIMEOUT:-900}
+      MCP_DNS_REBINDING_PROTECTION: ${MCP_DNS_REBINDING_PROTECTION:-0}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
       TZ: ${TZ:-Asia/Kolkata}
       WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
       WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
@@ -41,8 +56,34 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       AGENTIC_READ: ${AGENTIC_READ:-1}
       DATABASE_AGENT: ${DATABASE_AGENT:-1}
+      TASK_REQUIRED_FIELDS: ${TASK_REQUIRED_FIELDS:-task_title,task_description,assigned_to,deadline_date,deadline_time}
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-1}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?Set GOOGLE_CLIENT_ID in .env}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?Set GOOGLE_CLIENT_SECRET in .env}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8010/auth/google/callback}
+      GOOGLE_AUTHORIZATION_ENDPOINT: ${GOOGLE_AUTHORIZATION_ENDPOINT:-https://accounts.google.com/o/oauth2/v2/auth}
+      GOOGLE_TOKEN_ENDPOINT: ${GOOGLE_TOKEN_ENDPOINT:-https://oauth2.googleapis.com/token}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8088,http://localhost:5173}
+      AUTH_POST_LOGIN_REDIRECT: ${AUTH_POST_LOGIN_REDIRECT:-http://localhost:8088}
+      AUTH_ALLOWED_EMAIL_DOMAIN: ${AUTH_ALLOWED_EMAIL_DOMAIN:-}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Administrator}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-15}
+      REFRESH_TOKEN_DAYS: ${REFRESH_TOKEN_DAYS:-14}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      AUTH_COOKIE_SAME_SITE: ${AUTH_COOKIE_SAME_SITE:-lax}
+      AUTH_COOKIE_DOMAIN: ${AUTH_COOKIE_DOMAIN:-}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-1}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_PRIVATE_KEY_PATH: ${VAPID_PRIVATE_KEY_PATH:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@example.com}
+      MCP_BOOTSTRAP_EMPLOYEE_ID: ${MCP_BOOTSTRAP_EMPLOYEE_ID:-1}
+      MCP_BOOTSTRAP_CREDENTIAL_FILE: ${MCP_BOOTSTRAP_CREDENTIAL_FILE:-/run/secrets/fnw-mcp-authorization}
     volumes:
       - whisper_cache:/home/app/.cache
+      - ${FNW_MCP_AUTHORIZATION_FILE:-./tunnel/secrets/fnw-mcp-authorization}:${MCP_BOOTSTRAP_CREDENTIAL_FILE:-/run/secrets/fnw-mcp-authorization}:ro
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     healthcheck:
@@ -55,6 +96,42 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
+    networks:
+      - taskflow
+
+  reminder-worker:
+    image: task-flow-automations-backend:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "reminder_worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-fnw_task_logger}
+      TZ: ${TZ:-Asia/Kolkata}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8088,http://localhost:5173}
+      RUN_MIGRATIONS: "0"
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_PRIVATE_KEY_PATH: ${VAPID_PRIVATE_KEY_PATH:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@example.com}
+      REMINDER_POLL_SECONDS: ${REMINDER_POLL_SECONDS:-20}
+      REMINDER_BATCH_SIZE: ${REMINDER_BATCH_SIZE:-100}
+      REMINDER_MAX_RETRIES: ${REMINDER_MAX_RETRIES:-5}
+      REMINDER_RETRY_BASE_SECONDS: ${REMINDER_RETRY_BASE_SECONDS:-30}
+      REMINDER_RETRY_MAX_SECONDS: ${REMINDER_RETRY_MAX_SECONDS:-3600}
+      REMINDER_MAX_AGE_HOURS: ${REMINDER_MAX_AGE_HOURS:-168}
+      REMINDER_PROCESSING_TIMEOUT_SECONDS: ${REMINDER_PROCESSING_TIMEOUT_SECONDS:-300}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import os; os.kill(1, 0)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     networks:
       - taskflow
 
@@ -79,6 +156,40 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - taskflow
+
+  mcp-tunnel:
+    build:
+      context: .
+      dockerfile: tunnel/Dockerfile
+      args:
+        TUNNEL_CLIENT_BIN: ${TUNNEL_CLIENT_BIN:-tunnel/bin/tunnel-client}
+    image: task-flow-automations-mcp-tunnel:latest
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # OpenAI tunnel control-plane credential. Required for the tunnel to
+      # authenticate; never commit the real value. Default is empty so Compose
+      # management commands (config/down/ps) still work when the credential is
+      # not present. The mcp-tunnel entrypoint fails safely if it is missing.
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
+      TUNNEL_PROFILE_FILE: ${TUNNEL_PROFILE_FILE:-/etc/tunnel/fnw-chatgpt.yaml}
+      # File contains the full "Bearer fnw_mcp_..." header value.
+      FNW_MCP_AUTHORIZATION_FILE: /run/tunnel/fnw-mcp-authorization
+    volumes:
+      - ${TUNNEL_PROFILE_PATH:-./tunnel/config/fnw-chatgpt.compose.yaml}:/etc/tunnel/fnw-chatgpt.yaml:ro
+      - ${FNW_MCP_AUTHORIZATION_FILE:-./tunnel/secrets/fnw-mcp-authorization}:/run/tunnel/fnw-mcp-authorization:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://127.0.0.1:8080/healthz >/dev/null && code=$$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/readyz) && [ \"$$code\" = '200' ]"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     networks:
       - taskflow
 

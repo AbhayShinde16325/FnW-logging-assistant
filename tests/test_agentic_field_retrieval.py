@@ -54,6 +54,7 @@ def sample_task(**overrides) -> dict:
     values = {
         "id": 1784,
         "task_title": "Business report",
+        "task_description": "Monthly business report for the client",
         "assigned_to": "Rahul",
         "assigned_date": date(2026, 11, 10),
         "assigned_time": time(10, 30),
@@ -137,6 +138,11 @@ def test_the_reminder_date_is_never_replaced_by_the_deadline(monkeypatch):
         ("What is its status?", "status", "IN_PROGRESS"),
         ("Who is assigned to it?", "assigned_to", "Rahul"),
         ("What is its title?", "task_title", "Business report"),
+        (
+            "What is its expected outcome?",
+            "task_description",
+            "Monthly business report for the client",
+        ),
     ],
 )
 def test_each_requested_field_is_answered_directly(

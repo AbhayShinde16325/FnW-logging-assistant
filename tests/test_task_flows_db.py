@@ -160,6 +160,7 @@ def test_create_through_the_chat_route_inserts_exactly_one_record(
 ):
     extraction = ExtractionResult(
         task_title=f"Back-end optimization technique {marker}",
+        task_description=f"Optimise the back end for {marker}",
         assigned_to=marker,
         assigned_when="10 November 2026 at 10:30 AM",
         deadline_when="15 November 2026 at 5 PM",
@@ -182,7 +183,7 @@ def test_create_through_the_chat_route_inserts_exactly_one_record(
     first = client.post("/tasks/chat", json={"message": CREATE_MESSAGE}).json()
 
     assert first["intent"] == "CREATE_TASK"
-    assert first["stage"] == "fields"
+    assert first["stage"] == "confirm_fields"
 
     second = client.post(
         "/tasks/chat",
@@ -194,6 +195,7 @@ def test_create_through_the_chat_route_inserts_exactly_one_record(
     ).json()
 
     assert second["stage"] == "confirm_fields"
+    assert second["draft"]["status"] == "IN_PROGRESS"
 
     third = client.post(
         "/tasks/chat",
@@ -224,6 +226,7 @@ def test_create_through_the_chat_route_inserts_exactly_one_record(
 
     stored = read_row(final["task"]["id"])
     assert stored.task_title == f"Back-end optimization technique {marker}"
+    assert stored.task_description == f"Optimise the back end for {marker}"
     assert stored.assigned_to == marker
     assert stored.status == "IN_PROGRESS"
     assert stored.progress == 50
@@ -236,6 +239,7 @@ def test_create_does_not_touch_the_existing_records(client, marker, monkeypatch)
 
     extraction = ExtractionResult(
         task_title=f"Back-end optimization technique {marker}",
+        task_description=f"Optimise the back end for {marker}",
         assigned_to=marker,
         assigned_when="10 November 2026 at 10:30 AM",
         deadline_when="15 November 2026 at 5 PM",
@@ -312,6 +316,40 @@ def test_update_through_the_chat_route_keeps_the_task_id(
     assert stored.reminder_time == time(16, 30)
     assert stored.status == "PENDING"
     assert stored.progress == 0
+
+
+def test_update_changes_the_task_description(client, marker, monkeypatch):
+    title = f"Business report {marker}"
+    task_id = insert_row(title, assigned_to="Rahul")
+
+    monkeypatch.setattr(
+        task_service,
+        "extractor",
+        ScriptedExtractor(
+            update=TaskUpdate(
+                find=TaskUpdateFind(task_title=title),
+                changes=TaskUpdateChanges(
+                    task_description="Updated expected outcome"
+                ),
+            )
+        ),
+    )
+
+    response = client.post(
+        "/tasks/chat",
+        json={"message": f"Update the description of the {title} task"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["task"]["id"] == task_id
+    assert body["task"]["task_description"] == "Updated expected outcome"
+    assert count_rows(marker) == 1
+
+    stored = read_row(task_id)
+    assert stored.task_description == "Updated expected outcome"
+    assert stored.task_title == title
 
 
 def test_update_of_a_task_that_does_not_exist_inserts_nothing(

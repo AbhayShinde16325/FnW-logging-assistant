@@ -29,19 +29,25 @@ def client(monkeypatch):
 def staged_service(monkeypatch):
     """Service wired to a fake extractor and a fake create_task."""
     monkeypatch.setattr(task_service, "extractor", FakeExtractor(full_extraction()))
-    monkeypatch.setattr(
-        task_service,
-        "create_task",
-        lambda record: {
+    def fake_create(record):
+        return {
             "id": 1,
             "task_title": record.task_title,
+            "task_description": record.task_description,
             "assigned_to": record.assigned_to,
             "status": record.status,
             "progress": record.progress,
-            "reminder_date": str(record.reminder_date),
-            "reminder_time": record.reminder_time.strftime("%H:%M"),
-        },
-    )
+            "reminder_date": (
+                str(record.reminder_date) if record.reminder_date else None
+            ),
+            "reminder_time": (
+                record.reminder_time.strftime("%H:%M")
+                if record.reminder_time
+                else None
+            ),
+        }
+
+    monkeypatch.setattr(task_service, "create_task", fake_create)
 
 
 def test_health(client):
@@ -57,7 +63,7 @@ def test_text_start_requires_non_empty(client, staged_service):
 
 
 def test_staged_create_flow_end_to_end(client, staged_service):
-    # Stage 1: start -> one field (status) is missing
+    # Stage 1: the required fields are present, so the task is ready to confirm.
     response = client.post(
         "/tasks/text",
         json={"text": "Rahul has a Python API research task", "stage": "start"},
@@ -65,12 +71,13 @@ def test_staged_create_flow_end_to_end(client, staged_service):
     assert response.status_code == 200
 
     first = response.json()
-    assert first["status"] == "clarification_required"
-    assert first["stage"] == "fields"
-    assert "status" in first["missing_fields"]
+    assert first["status"] == "confirmation_required"
+    assert first["stage"] == "confirm_fields"
+    assert first["missing_fields"] == []
+    assert first["draft"]["task_description"] == "Summarise the API findings"
     draft = first["draft"]
 
-    # Stage 2: answer the missing field
+    # Stage 2: an optional field can still be edited before saving.
     response = client.post(
         "/tasks/text",
         json={
@@ -87,7 +94,7 @@ def test_staged_create_flow_end_to_end(client, staged_service):
     assert second["stage"] == "confirm_fields"
     draft = second["draft"]
 
-    # Stage 3: confirm the 8 fields -> reminder is asked
+    # Stage 3: confirmation asks for the optional reminder.
     response = client.post(
         "/tasks/text",
         json={
@@ -99,37 +106,18 @@ def test_staged_create_flow_end_to_end(client, staged_service):
     )
     assert response.status_code == 200
 
-    third = response.json()
-    assert third["status"] == "reminder_required"
-    assert third["stage"] == "reminder"
-    draft = third["draft"]
+    reminder = response.json()
+    assert reminder["status"] == "reminder_required"
+    assert reminder["stage"] == "reminder"
+    draft = reminder["draft"]
 
-    # Stage 4: relative reminder -> absolute confirmation
+    # Stage 4: no reminder is required, so the task is saved without one.
     response = client.post(
         "/tasks/text",
         json={
-            "text": "Rahul has a Python API research task",
+            "text": "no reminder",
             "stage": "reminder",
             "draft": draft,
-            "reminder_text": "30 minutes before the deadline",
-        },
-    )
-    assert response.status_code == 200
-
-    fourth = response.json()
-    assert fourth["status"] == "reminder_confirmation_required"
-    assert fourth["reminder"]["date"] == "2026-11-15"
-    assert fourth["reminder"]["time"] == "16:30"
-    draft = fourth["draft"]
-
-    # Stage 5: final confirmation -> task saved
-    response = client.post(
-        "/tasks/text",
-        json={
-            "text": "Rahul has a Python API research task",
-            "stage": "confirm_reminder",
-            "draft": draft,
-            "confirm": True,
         },
     )
     assert response.status_code == 200
@@ -137,8 +125,9 @@ def test_staged_create_flow_end_to_end(client, staged_service):
     final = response.json()
     assert final["status"] == "success"
     assert final["task"]["status"] == "IN_PROGRESS"
-    assert final["task"]["reminder_date"] == "2026-11-15"
-    assert final["task"]["reminder_time"] == "16:30"
+    assert final["task"]["task_description"] == "Summarise the API findings"
+    assert final["task"]["reminder_date"] is None
+    assert final["task"]["reminder_time"] is None
 
 
 def test_edit_during_confirmation_round_trip(client, staged_service):
@@ -240,10 +229,10 @@ def test_chat_asks_one_field_at_a_time_and_updates_draft(client, staged_service)
     assert response.status_code == 200
 
     first = response.json()
-    assert first["status"] == "clarification_required"
-    assert first["missing_fields"] == ["status"]
-    assert "status" in first["reply"].lower()
+    assert first["status"] == "confirmation_required"
+    assert first["missing_fields"] == []
     assert first["draft"]["task_title"] == "Python API research"
+    assert first["draft"]["task_description"] == "Summarise the API findings"
 
     response = client.post(
         "/tasks/chat",
@@ -265,27 +254,15 @@ def test_chat_asks_one_field_at_a_time_and_updates_draft(client, staged_service)
             "draft": second["draft"],
         },
     )
-    third = response.json()
-    assert third["status"] == "reminder_required"
+    reminder = response.json()
+    assert reminder["status"] == "reminder_required"
 
     response = client.post(
         "/tasks/chat",
         json={
-            "message": "30 minutes before the deadline",
-            "stage": third["stage"],
-            "draft": third["draft"],
-        },
-    )
-    fourth = response.json()
-    assert fourth["status"] == "reminder_confirmation_required"
-    assert fourth["reminder"]["time"] == "16:30"
-
-    response = client.post(
-        "/tasks/chat",
-        json={
-            "message": "yes",
-            "stage": fourth["stage"],
-            "draft": fourth["draft"],
+            "message": "no reminder",
+            "stage": reminder["stage"],
+            "draft": reminder["draft"],
         },
     )
     final = response.json()
@@ -302,7 +279,7 @@ def test_chat_syncs_pending_status_with_progress(client, staged_service):
         },
     )
     first = response.json()
-    assert first["missing_fields"] == ["status"]
+    assert first["missing_fields"] == []
     assert first["draft"]["progress"] == 50
 
     response = client.post(

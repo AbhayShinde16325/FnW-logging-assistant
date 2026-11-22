@@ -11,6 +11,7 @@ A Python-based task logging application that uses AI to extract structured task 
 - **SQLAlchemy** – Database ORM
 - **PostgreSQL 16** – Database
 - **Docker & Docker Compose** – Containerization and database management
+- **Web Push / VAPID** – browser and installed-PWA reminders
 
 ## Quick Start (Docker)
 
@@ -23,14 +24,27 @@ cd FnW-logging-assistant
 cp .env.example .env
 ```
 
-Set `POSTGRES_PASSWORD` and `COHERE_API_KEY` in `.env`, then start everything:
+Set `POSTGRES_PASSWORD`, `COHERE_API_KEY`, `AUTH_SECRET_KEY`,
+`GOOGLE_CLIENT_ID`, and `GOOGLE_CLIENT_SECRET` in `.env`. To enable browser
+push, also generate a VAPID key pair:
 
 ```bash
-# 2. Build and start PostgreSQL, the API, and the web UI
-docker compose up -d --build
+# 2. Generate VAPID keys, merge the values into .env, and delete the temp file
+python scripts/generate_vapid_keys.py --env-out /tmp/vapid.env
 ```
 
-Then open `http://<server-ip>:8080`. See
+Then start everything:
+
+```bash
+# 3. Build and start PostgreSQL, the API, the reminder worker, and the web UI
+docker compose up -d --build
+
+# 4. Provision the first administrator (once)
+docker compose exec backend python -m auth.bootstrap --email you@example.com
+```
+
+Then open `http://<server-ip>:8080` and sign in with Google. See
+[Authentication and roles](#authentication-and-roles) and
 [Run with Docker](#3-run-with-docker-recommended) for configuration and
 troubleshooting.
 
@@ -69,6 +83,9 @@ Set at least these values in `.env`:
 ```env
 POSTGRES_PASSWORD=change_me
 COHERE_API_KEY=your_cohere_api_key_here
+AUTH_SECRET_KEY=generate_a_long_random_value
+GOOGLE_CLIENT_ID=your_google_oauth_client_id
+GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
 ```
 
 Docker Compose builds `DATABASE_URL` automatically and points it at the `db`
@@ -85,6 +102,33 @@ WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
 DATABASE_AGENT=1            # LLM tool-calling database agent
 AGENTIC_READ=1              # let the read planner repair a zero-row query
+TASK_REQUIRED_FIELDS=task_title,task_description,assigned_to,deadline_date,deadline_time
+
+GOOGLE_REDIRECT_URI=http://localhost:8080/api/auth/google/callback
+FRONTEND_URL=http://localhost:8080
+AUTH_POST_LOGIN_REDIRECT=http://localhost:8080
+AUTH_ALLOWED_EMAIL_DOMAIN=example.com   # optional work-email restriction
+ACCESS_TOKEN_MINUTES=15
+REFRESH_TOKEN_DAYS=14
+AUTH_COOKIE_SECURE=false                # true on an HTTPS deployment
+AUTH_COOKIE_SAME_SITE=lax
+BOOTSTRAP_ADMIN_EMAIL=admin@example.com
+BOOTSTRAP_ADMIN_NAME=Administrator
+
+# Reminder worker and Web Push (optional, but required for browser push)
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=mailto:admin@example.com
+REMINDER_POLL_SECONDS=20
+REMINDER_BATCH_SIZE=100
+REMINDER_MAX_RETRIES=5
+REMINDER_MAX_AGE_HOURS=168
+```
+
+Generate the auth secret with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
 If `FRONTEND_PORT` or `BACKEND_PORT` is already in use on the server, change
@@ -92,19 +136,187 @@ it in `.env`.
 
 **Important:** Never commit your `.env` file or API keys to GitHub.
 
+## MCP server and provider-independent AI
+
+The application exposes its task, employee, notification, read-only database
+and conversation capabilities through a central Model Context Protocol server
+at `/mcp/` (Streamable HTTP). Cohere discovers those tools through MCP; the
+business logic stays in the existing services.
+
+```env
+MCP_ENABLED=true
+MCP_TRANSPORT=streamable-http
+MCP_SERVER_NAME=fnw-task-manager
+MCP_SERVER_URL=http://127.0.0.1:8000/mcp
+AI_PROVIDER=cohere
+```
+
+External MCP clients (e.g. OpenClaw 2026.10.10) should use a dedicated,
+revocable MCP client credential issued to an active employee via
+`POST /auth/mcp-credentials` (plaintext shown once; only a SHA-256 hash is
+stored). Configure the client with
+`Authorization: Bearer fnw_mcp_<credential>` over HTTPS. Browser JWT/session
+authentication, refresh/CSRF/session-rotation and reuse-detection, and
+Cohere's local MCP URL/flow remain unchanged.
+
+See [docs/MCP_ARCHITECTURE.md](docs/MCP_ARCHITECTURE.md) for the architecture,
+authentication requirements, tool/resource/prompt catalog, external client
+setup, Docker deployment and how to add a future provider.
+
+## Authentication and roles
+
+Every task, chat, voice, feedback, and AI database-tool action requires a
+signed-in employee. Authentication uses Google OpenID Connect Authorization
+Code flow with PKCE. The backend validates the OAuth `state`, the OIDC
+`nonce`, Google's RS256 signature, the issuer, the audience, the expiry, the
+Google `sub`, and the verified email address. Only pre-provisioned, active
+employees can sign in; there is no public registration.
+
+### Google Cloud setup
+
+1. Create an OAuth 2.0 Client ID of type **Web application** in Google Cloud
+   Console.
+2. Add the redirect URI for this deployment, for example:
+   `http://localhost:8080/api/auth/google/callback` or
+   `https://tasks.example.com/api/auth/google/callback`.
+3. Put the client ID and secret in `.env` as `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`.
+4. Set `GOOGLE_REDIRECT_URI`, `FRONTEND_URL`, and
+   `AUTH_POST_LOGIN_REDIRECT` to the public URL of the frontend. On HTTPS,
+   set `AUTH_COOKIE_SECURE=true`.
+
+### Provisioning employees
+
+Start the stack, then create the first administrator:
+
+```bash
+docker compose exec backend python -m auth.bootstrap \
+  --email admin@example.com --name "Admin"
+```
+
+That command seeds the canonical roles and permissions and promotes or creates
+the administrator. Add managers and employees through SQL or an internal admin
+tool with a `roles.name` of `MANAGER` or `EMPLOYEE`. Deactivating an employee
+(`employees.is_active = false`) immediately blocks new refreshes because the
+backend rechecks the employee and session on every request.
+
+### Roles
+
+| Role | Capabilities |
+| --- | --- |
+| `ADMIN` | All task, employee, role, and report permissions |
+| `MANAGER` | Manage all tasks and employees, view reports; cannot grant `ADMIN` or modify administrator accounts |
+| `EMPLOYEE` | Read tasks assigned to their employee account and update only their progress |
+
+Backend permission dependencies and the direct `/tasks` endpoints enforce
+this. Task ownership uses `assigned_to_employee_id` only; display names never
+authorize access. Employees may update progress through
+`PATCH /tasks/{id}/progress`, while full edits and deletions require the
+manager/admin permissions. The `0002_rbac_task_policy` migration fixes the
+role mappings and backfills task and conversation-memory employee ids only
+from unique, exact display-name matches.
+
+### Sessions
+
+- Short-lived JWT access tokens are held in frontend memory only.
+- Rotating refresh tokens are random, hashed in the `sessions` table, and sent
+  in an HttpOnly, Secure-configurable, SameSite cookie.
+- Refresh cookies are rotated on every refresh. Replaying a revoked token
+  revokes every session for that employee.
+- Logout revokes one session; logout-all revokes every session of the
+  employee.
+- The refresh cookie is paired with a readable CSRF cookie and the
+  `X-CSRF-Token` header on state-changing auth requests.
+
+### Migrations
+
+Alembic owns schema changes:
+
+```bash
+alembic upgrade head
+```
+
+The backend container runs `alembic upgrade head` automatically before
+startup (`RUN_MIGRATIONS=1` by default). Existing task rows and volumes are
+preserved. `0001_auth_rbac` creates the auth/RBAC tables and nullable
+employee-id columns; `0002_rbac_task_policy` updates the canonical role
+mappings and safely backfills ownership ids; `0003_reminder_notifications`
+adds `employees.timezone`, `notifications`, and `push_subscriptions` with
+additive inspector-guarded changes.
+`0004_intelligent_notification_fields` adds notification `priority`,
+`voice_text`, and `payload` metadata for attention/prioritization.
+
+### Reminder notifications and Web Push
+
+A task reminder is scheduled only when both `tasks.reminder_date` and
+`tasks.reminder_time` are set. The employee's local wall-clock time is
+resolved through `employees.timezone`, converted to naive UTC, and stored in
+`notifications.scheduled_at`. The default timezone is `Asia/Kolkata`; each
+employee can change their own timezone from the notification panel.
+
+The separate `reminder-worker` Compose service polls PostgreSQL, claims due
+rows with `FOR UPDATE SKIP LOCKED`, commits the claim, and only then delivers
+push messages. It never holds a database transaction open during delivery.
+Unsent reminders are cancelled when a task is rescheduled, reassigned,
+completed, cancelled, or deleted, so stale reminders cannot fire later. The
+worker also recovers stale claims and retries transient push failures with
+bounded exponential backoff. Duplicate prevention is enforced by the unique
+key `(employee_id, task_id, notification_type, scheduled_at)`.
+
+The in-app notification center works without push. Browser push additionally
+requires:
+
+1. A VAPID key pair, configured on both the backend and worker as
+   `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (or `VAPID_PRIVATE_KEY_PATH`).
+   The private key is server-only and is never returned or logged.
+2. HTTPS in production. Service workers and Push API require a secure
+   context; `localhost` is the exception for development.
+3. The employee enabling notifications from the bell menu. Devices and
+   subscriptions are self-only: a manager or administrator cannot read
+   another employee's notifications or register/remove their devices.
+4. On iOS/iPadOS 16.4 or later, the site must be added to the Home Screen and
+   notifications enabled from the installed web app. iOS does not expose Web
+   Push to an ordinary Safari tab.
+
+Generate keys once and keep the private key backed up and out of Git:
+
+```bash
+python scripts/generate_vapid_keys.py --env-out /tmp/vapid.env
+# Merge the three lines into .env, then:
+rm /tmp/vapid.env
+```
+
+The reminder worker can run more than once. Multiple workers coordinate through
+the claim columns and will not send the same notification twice. To run a
+single deterministic processing pass for operations/debugging:
+
+```bash
+REMINDER_WORKER_ONCE=1 python -m reminder_worker
+```
+
+**Sound:** the notification center can play a short optional sound while the
+app is open and the browser permits audio. A website cannot bypass silent
+mode, Do Not Disturb, OS notification settings, or autoplay restrictions; it
+also cannot guarantee a sound for a background push.
+
+**Testing limitation:** automated tests mock the push provider. Real delivery
+still has to be verified in a real browser with a real subscription.
+
 ## 3. Run with Docker (recommended)
 
 Prerequisites: Docker Engine with the Compose v2 plugin
 (`docker compose version`).
 
-Build and start the whole stack (`db`, `backend`, `frontend`) with one command:
+Build and start the whole stack (`db`, `backend`, `reminder-worker`, `frontend`)
+with one command:
 
 ```bash
 docker compose up -d --build
 ```
 
 That single command builds the images, starts PostgreSQL, waits for it to be
-healthy, starts the API, and then serves the frontend through nginx.
+healthy, starts the API, starts the reminder worker, and then serves the
+frontend through nginx.
 
 Open the application:
 
@@ -124,6 +336,7 @@ Check the stack:
 ```bash
 docker compose ps
 docker compose logs -f backend
+docker compose logs -f reminder-worker
 ```
 
 To start already-built images without rebuilding:
@@ -212,10 +425,19 @@ Run the database CRUD demo:
 python -m database.crud_demo
 ```
 
-Run the test suite:
+Run the deterministic test suite (no live Cohere calls):
 
 ```bash
-python -m pytest tests/ -q
+AGENTIC_READ=0 DATABASE_AGENT=0 python -m pytest tests -q
+```
+
+`AGENTIC_READ=1` uses a live model and is not deterministic. Run the separate
+reminder worker while developing push locally:
+
+```bash
+REMINDER_WORKER_ONCE=1 python -m reminder_worker
+# or, for a polling loop:
+python -m reminder_worker
 ```
 
 The tests in `tests/test_task_intents_db.py` and `tests/test_task_flows_db.py`
@@ -367,19 +589,40 @@ value and never into another action.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Liveness check |
-| `GET` | `/tasks` | Every stored task |
-| `GET` | `/tasks/{task_id}` | One task |
+| `GET` | `/tasks` | Tasks visible to the signed-in employee |
+| `GET` | `/tasks/{task_id}` | One visible task |
+| `POST` | `/tasks` | Create a task (ADMIN/MANAGER) |
+| `PATCH` | `/tasks/{task_id}` | Edit a task (ADMIN/MANAGER) |
+| `PATCH` | `/tasks/{task_id}/progress` | Update progress on an assigned task |
+| `DELETE` | `/tasks/{task_id}` | Delete a task with `CONFIRM DELETE` (ADMIN/MANAGER) |
 | `POST` | `/tasks/text` | One turn of the text conversation |
 | `POST` | `/tasks/chat` | One turn of the chat conversation |
 | `POST` | `/tasks/voice` | One turn from an audio file |
 | `POST` | `/tasks/voice/turn` | One turn from an audio file (conversation state) |
+| `GET` | `/auth/google/login` | Start Google OIDC sign-in |
+| `GET` | `/auth/google/callback` | Google redirect URI |
+| `POST` | `/auth/refresh` | Rotate the refresh token and issue an access token |
+| `POST` | `/auth/logout` | Revoke the current session |
+| `POST` | `/auth/logout-all` | Revoke all sessions of the employee |
+| `GET` | `/auth/me` | The signed-in employee and permissions |
+| `GET` | `/notifications` | Self-only notification list and unread count |
+| `GET` | `/notifications/unread-count` | Self-only unread count |
+| `GET` | `/notifications/settings` | Self-only timezone and push status |
+| `PATCH` | `/notifications/settings` | Update the employee's timezone |
+| `PATCH` | `/notifications/{id}/read` | Mark one own notification read |
+| `POST` | `/notifications/read-all` | Mark all own notifications read |
+| `GET` | `/push/public-key` | Public VAPID key and push configuration status |
+| `GET` | `/push/subscriptions` | List only the signed-in employee's devices |
+| `POST` | `/push/subscribe` | Register the signed-in employee's subscription |
+| `POST` | `/push/unsubscribe` | Remove the signed-in employee's subscription |
 
 The conversation is stateless: the client sends the `stage` and the `draft`
 it received in the previous answer back with the next message.
 
-The chat and the voice route take two optional fields, `conversation_id` and
-`user_id`. They are used for the conversation memory only: a client that does
-not send them keeps the old, stateless behaviour.
+The chat and the voice route take an optional `conversation_id`. The backend
+derives `user_id` from the authenticated employee, so a client can never read
+or write another employee's conversation memory. `AUTH_REQUIRED=0` is only
+for the automated test suite and keeps the legacy unauthenticated behaviour.
 
 Every answer contains the `intent` that was detected, so the client can tell
 a creation from an update:
@@ -417,7 +660,7 @@ the body above.
 | --- | --- |
 | `fields` | A new task is being collected, one field at a time |
 | `confirm_fields` | The new task is waiting for a confirmation |
-| `reminder` / `confirm_reminder` | The reminder of the new task is being set |
+| `reminder` / `confirm_reminder` | The reminder of the new task is being set; it is optional and is skipped when the employee says it is not required |
 | `select_task` | Several tasks match; the employee has to pick one |
 | `confirm_update` | An update is waiting for the missing value or a confirmation |
 | `confirm_delete` | A delete is waiting for `CONFIRM DELETE` |

@@ -153,6 +153,7 @@ def ask_model(system_prompt: str, user_input: str, model) -> str:
 
 class TaskDetails(BaseModel):
     task_title: str | None = Field(default=None, min_length=1)
+    task_description: str | None = None
     assigned_to: str | None = None
     assigned_date: date | None = None
     assigned_time: time | None = None
@@ -186,6 +187,7 @@ class ExtractionResult(BaseModel):
     """
 
     task_title: str | None = None
+    task_description: str | None = None
     assigned_to: str | None = None
     assigned_when: str | None = None
     deadline_when: str | None = None
@@ -214,7 +216,7 @@ class ExtractionResult(BaseModel):
 
 
 class TaskRecord(TaskDetails):
-    """Final, fully-confirmed task: the 8 stored fields + the reminder.
+    """Final, fully-confirmed task: the stored fields + the reminder.
 
     reminder_date / reminder_time map to the reminder columns on the Task
     model and are persisted by the repository.
@@ -236,6 +238,7 @@ class TaskUpdateChanges(BaseModel):
     """Only the fields the user explicitly asked to change."""
 
     task_title: str | None = None
+    task_description: str | None = None
     assigned_to: str | None = None
     assigned_when: str | None = None
     deadline_when: str | None = None
@@ -480,6 +483,7 @@ class TaskExtractor:
         Return ONLY valid JSON with these fields:
         {
             "task_title": "string",
+            "task_description": "short description or expected outcome, or null",
             "assigned_to": "name or null",
             "assigned_date": "YYYY-MM-DD or null",
             "assigned_time": "HH:MM or null",
@@ -495,13 +499,14 @@ class TaskExtractor:
         3. If a value is missing, return null. Never convert words like "aaj", "kal", "today", or "tomorrow" into a date.
         4. Dates must be in YYYY-MM-DD format.
         5. Times must be in 24-hour HH:MM format.
-        6. assigned_to is the name of the person the task is assigned to, or null if not stated.
-        7. If progress is missing, use 0 unless completed.
-        8. If completed, progress must be 100.
-        9. Progress must be between 0 and 100.
-        10. If progress is above 0, status should normally be IN_PROGRESS.
-        11. Understand English and Hinglish.
-        12. Return exactly one JSON object, with no text, Markdown, or extra objects before or after it.
+        6. task_description is the description or expected outcome stated by the employee, or null.
+        7. assigned_to is the name of the person the task is assigned to, or null if not stated.
+        8. If progress is missing, use 0 unless completed.
+        9. If completed, progress must be 100.
+        10. Progress must be between 0 and 100.
+        11. If progress is above 0, status should normally be IN_PROGRESS.
+        12. Understand English and Hinglish.
+        13. Return exactly one JSON object, with no text, Markdown, or extra objects before or after it.
         """
 
         last_error = None
@@ -567,6 +572,7 @@ class TaskExtractor:
         Return ONLY valid JSON with these fields:
         {
             "task_title": "string or null",
+            "task_description": "short description or expected outcome, or null",
             "assigned_to": "name or null",
             "assigned_when": "verbatim date/time phrase about when the task was assigned, or null",
             "deadline_when": "verbatim date/time phrase about the deadline, or null",
@@ -579,10 +585,11 @@ class TaskExtractor:
         1. Copy date/time phrases VERBATIM from the input (e.g. "tomorrow at 5", "15 November 2026 at 5 PM"). Never convert them into dates or times.
         2. If a phrase or value is missing, return null.
         3. Do not invent information. Do not use today's date.
-        4. assigned_to is the person the task is assigned to, or null.
-        5. progress is only the stated percentage, or null.
-        6. Understand English and Hinglish.
-        7. Return exactly one JSON object, with no text, Markdown, or extra objects before or after it.
+        4. task_description is the description or expected outcome, or null.
+        5. assigned_to is the person the task is assigned to, or null.
+        6. progress is only the stated percentage, or null.
+        7. Understand English and Hinglish.
+        8. Return exactly one JSON object, with no text, Markdown, or extra objects before or after it.
         """
 
         last_error = None
@@ -694,6 +701,7 @@ class TaskExtractor:
             },
             "changes": {
                 "task_title": "new title, or null",
+                "task_description": "new description or expected outcome, or null",
                 "assigned_to": "new assignee, or null",
                 "assigned_when": "verbatim date/time phrase, or null",
                 "deadline_when": "verbatim date/time phrase, or null",
@@ -751,7 +759,8 @@ class TaskExtractor:
            "requested_field" to exactly one of:
            progress, status, deadline_date, deadline_time, deadline,
            reminder_date, reminder_time, reminder, assigned_to, assigned_date,
-           assigned_time, task_title, id, full.
+           assigned_time, task_title, task_description, description,
+           expected_outcome, id, full.
            Use "deadline" for a general due-date question, "reminder" for a
            general reminder question, and "full" only when the employee asks
            for all details. Otherwise return null.

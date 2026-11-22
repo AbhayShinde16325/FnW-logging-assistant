@@ -12,6 +12,7 @@ No I/O happens here:
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -45,17 +46,64 @@ STAGE_UPDATE = "update"
 # Phase A fields, in the order they are asked about.
 FIELD_ORDER = [
     "task_title",
+    "task_description",
     "assigned_to",
-    "assigned_date",
-    "assigned_time",
     "deadline_date",
     "deadline_time",
+    "assigned_date",
+    "assigned_time",
     "status",
     "progress",
 ]
 
+# The fields that must be present before a new task can be saved. The list is
+# configurable because different teams require different levels of detail.
+DEFAULT_REQUIRED_FIELDS = (
+    "task_title",
+    "task_description",
+    "assigned_to",
+    "deadline_date",
+    "deadline_time",
+)
+
+REQUIRED_FIELD_ALIASES = {
+    "deadline": ("deadline_date", "deadline_time"),
+    "assigned": ("assigned_date", "assigned_time"),
+    "description": ("task_description",),
+    "expected_outcome": ("task_description",),
+}
+
+
+def required_task_fields() -> tuple[str, ...]:
+    """The configurable required fields, in the canonical priority order."""
+
+    raw = os.getenv("TASK_REQUIRED_FIELDS")
+
+    if raw is None or not raw.strip():
+        return DEFAULT_REQUIRED_FIELDS
+
+    requested = []
+
+    for item in raw.split(","):
+        name = item.strip().lower()
+
+        if not name:
+            continue
+
+        if name in REQUIRED_FIELD_ALIASES:
+            requested.extend(REQUIRED_FIELD_ALIASES[name])
+        elif name in FIELD_ORDER:
+            requested.append(name)
+
+    selected = {name for name in requested}
+    ordered = tuple(name for name in FIELD_ORDER if name in selected)
+
+    return ordered or DEFAULT_REQUIRED_FIELDS
+
+
 FIELD_LABELS = {
     "task_title": "task title",
+    "task_description": "description or expected outcome",
     "assigned_to": "assignee",
     "assigned_date": "assigned date",
     "assigned_time": "assigned time",
@@ -69,14 +117,56 @@ FIELD_LABELS = {
 
 DATE_FIELDS = {"assigned_date": "assigned_time", "deadline_date": "deadline_time"}
 TIME_FIELDS = {"assigned_time": "assigned_date", "deadline_time": "deadline_date"}
-TEXT_FIELDS = {"task_title", "assigned_to"}
+TEXT_FIELDS = {"task_title", "task_description", "assigned_to"}
 STATUS_VALUES = {"PENDING", "IN_PROGRESS", "COMPLETED"}
 
 DEFAULT_REMINDER_QUESTION = (
     "When should the reminder be? Give a date and time (e.g. '15 November 2026 "
     "at 4 PM') or say how long before the deadline (e.g. '30 minutes before "
-    "the deadline')."
+    "the deadline'). If you do not need a reminder, say 'no reminder'."
 )
+
+REMINDER_WORD_PATTERN = re.compile(r"remind|notif|alert", re.IGNORECASE)
+
+REMINDER_DECLINE_PHRASES = (
+    "no reminder",
+    "no reminders",
+    "not required",
+    "not needed",
+    "not necessary",
+    "no need",
+    "don't need",
+    "do not need",
+    "dont need",
+    "don't want",
+    "do not want",
+    "dont want",
+    "don't remind",
+    "do not remind",
+    "dont remind",
+    "without a reminder",
+    "without reminder",
+    "skip reminder",
+    "skip the reminder",
+    "no notification",
+    "no notification required",
+    "no alert",
+    "keep it optional",
+    "reminder is optional",
+)
+
+
+def reminder_is_declined(text: str | None) -> bool:
+    """Whether the employee explicitly said that a reminder is not required."""
+
+    normalized = " ".join(
+        (text or "").lower().replace(",", " ").replace(".", " ").split()
+    )
+
+    if not normalized:
+        return False
+
+    return any(phrase in normalized for phrase in REMINDER_DECLINE_PHRASES)
 
 STATUS_PHRASES = {
     "pending": "PENDING",
@@ -319,20 +409,35 @@ class TaskDraftEngine:
 
     # ------------------------------------------------------------------ steps
 
-    def start(self, user_input: str) -> StepResult:
+    def start(
+        self,
+        user_input: str,
+        *,
+        default_assignee: str | None = None,
+    ) -> StepResult:
         extraction = self.extractor.extract_draft(user_input)
 
         draft = self._empty_draft()
+        draft["reminder_skipped"] = bool(
+            REMINDER_WORD_PATTERN.search(user_input or "")
+        ) and reminder_is_declined(user_input)
         draft["raw"] = {
             "assigned_when": extraction.assigned_when,
             "deadline_when": extraction.deadline_when,
             "reminder_when": extraction.reminder_when,
         }
 
-        if extraction.task_title:
+        if extraction.task_title and extraction.task_title.strip():
             draft["task_title"] = extraction.task_title.strip()
+        if (
+            extraction.task_description
+            and extraction.task_description.strip()
+        ):
+            draft["task_description"] = extraction.task_description.strip()
         if extraction.assigned_to:
             draft["assigned_to"] = extraction.assigned_to.strip()
+        elif default_assignee:
+            draft["assigned_to"] = default_assignee
         if extraction.status:
             draft["status"] = extraction.status
         if extraction.progress is not None:
@@ -410,17 +515,14 @@ class TaskDraftEngine:
             extraction, draft, target=target
         )
 
-        if target is not None and target not in answers:
-            # If the reply clearly answers a different date field (for
-            # example the user volunteers the deadline while we asked for the
-            # assigned date), keep that value and re-ask the original field
-            # instead of storing unrelated text in the wrong field.
-            conflicts = self._conflicts_with_target(target, user_input)
-
-            if not (answers and conflicts):
-                value = self._fallback_answer(target, user_input, extraction)
-                if value is not None:
-                    answers[target] = value
+        if target is not None and target not in answers and not answers:
+            # A bare answer ("Ram", "tomorrow at 5 pm") is mapped to the field
+            # the assistant just asked about. If the extractor identified any
+            # other field, trust it instead of storing unrelated text in the
+            # wrong field.
+            value = self._fallback_answer(target, user_input, extraction)
+            if value is not None:
+                answers[target] = value
 
         return self.apply(draft, answers)
 
@@ -433,15 +535,18 @@ class TaskDraftEngine:
             extraction, draft, include_existing=True
         )
 
-        if not answers:
-            # Fall back to the deterministic parsers so short replies such as
-            # "IN_PROGRESS" or "40 percent" still update the draft.
-            status = self._status_from_text(user_input)
-            progress = self._progress_from_text(user_input)
-            if status is not None:
-                answers["status"] = status
-            if progress is not None:
-                answers["progress"] = progress
+        # Always run the deterministic parsers as a supplement: an extractor
+        # can return an unrelated existing value (for example progress=50)
+        # from a short reply such as "it is in progress". Explicit values from
+        # the extractor still win.
+        status = self._status_from_text(user_input)
+        progress = self._progress_from_text(user_input)
+
+        if status is not None:
+            answers.setdefault("status", status)
+
+        if progress is not None:
+            answers.setdefault("progress", progress)
 
         if not answers:
             return self._next_step(
@@ -466,14 +571,52 @@ class TaskDraftEngine:
 
         self._sync_status_progress(draft, {"status", "progress"})
 
+        missing = [
+            name
+            for name in required_task_fields()
+            if draft.get(name) in (None, "")
+        ]
+
+        if missing:
+            return StepResult(
+                STAGE_FIELDS,
+                draft=draft,
+                missing_fields=missing,
+                question=self._default_question(missing[0], draft),
+            )
+
         rule_error = self._check_rules(draft)
         if rule_error:
             return StepResult(STAGE_FIELDS, draft=draft, question=rule_error)
 
-        return self._begin_reminder(draft)
+        reminder_when = (draft.get("raw") or {}).get("reminder_when")
+
+        if draft.get("reminder_skipped") or reminder_is_declined(reminder_when):
+            return self.skip_reminder(draft)
+
+        has_reminder = bool(
+            draft.get("reminder_date") and draft.get("reminder_time")
+        )
+
+        if not has_reminder:
+            return self._begin_reminder(draft)
+
+        record = self._build_record(draft)
+
+        return StepResult(
+            STAGE_DONE,
+            draft=draft,
+            done=True,
+            record=record,
+            message="Task ready to save.",
+        )
 
     def set_reminder(self, draft: dict, reminder_text: str) -> StepResult:
+        if reminder_is_declined(reminder_text):
+            return self.skip_reminder(draft)
+
         draft = dict(draft or {})
+        draft["reminder_skipped"] = False
         context = draft.pop("reminder_partial", None)
 
         try:
@@ -524,6 +667,27 @@ class TaskDraftEngine:
             message="Task ready to save.",
         )
 
+    def skip_reminder(self, draft: dict) -> StepResult:
+        """Finish the draft without a reminder when the employee declined it."""
+
+        draft = dict(draft or {})
+        draft.pop("reminder_partial", None)
+        draft["reminder_date"] = None
+        draft["reminder_time"] = None
+        draft["reminder_skipped"] = True
+
+        raw = dict(draft.get("raw") or {})
+        raw["reminder_when"] = None
+        draft["raw"] = raw
+
+        return StepResult(
+            STAGE_DONE,
+            draft=draft,
+            done=True,
+            record=self._build_record(draft),
+            message="Task ready to save without a reminder.",
+        )
+
     # ---------------------------------------------------------------- helpers
 
     def _now(self) -> datetime:
@@ -536,12 +700,13 @@ class TaskDraftEngine:
         draft = {name: None for name in FIELD_ORDER}
         draft["reminder_date"] = None
         draft["reminder_time"] = None
+        draft["reminder_skipped"] = False
         return draft
 
     @staticmethod
     def _first_missing(draft: dict) -> str | None:
-        for name in FIELD_ORDER:
-            if draft.get(name) is None:
+        for name in required_task_fields():
+            if draft.get(name) in (None, ""):
                 return name
         return None
 
@@ -559,14 +724,25 @@ class TaskDraftEngine:
         """
 
         def wants(name: str) -> bool:
-            if include_existing:
-                return True
-            return name == target or draft.get(name) is None
+            # The extractor only sees the current reply, so any non-null field
+            # it reports is an intentional update. This lets an employee
+            # correct an earlier value without losing any other collected
+            # information.
+            return True
 
         answers: dict[str, object] = {}
 
         if extraction.task_title and wants("task_title"):
-            answers["task_title"] = extraction.task_title.strip()
+            title = extraction.task_title.strip()
+            if title:
+                answers["task_title"] = title
+
+        if getattr(extraction, "task_description", None) and wants(
+            "task_description"
+        ):
+            description = extraction.task_description.strip()
+            if description:
+                answers["task_description"] = description
 
         if extraction.assigned_to and wants("assigned_to"):
             answers["assigned_to"] = extraction.assigned_to.strip()
@@ -771,7 +947,11 @@ class TaskDraftEngine:
         draft = dict(draft)
         stored_questions = draft.pop("_questions", None) or {}
 
-        missing = [name for name in FIELD_ORDER if draft.get(name) is None]
+        missing = [
+            name
+            for name in required_task_fields()
+            if draft.get(name) in (None, "")
+        ]
 
         if errors:
             question = "  ".join(errors)
@@ -794,6 +974,11 @@ class TaskDraftEngine:
 
     @staticmethod
     def _default_question(name: str, draft: dict) -> str:
+        if name == "task_description":
+            return (
+                "What is the expected outcome, or a short description of "
+                "the task?"
+            )
         if name in TIME_FIELDS and draft.get(TIME_FIELDS[name]):
             return (
                 f"What time on {draft[TIME_FIELDS[name]]} should the "
@@ -839,15 +1024,40 @@ class TaskDraftEngine:
     def _build_record(self, draft: dict) -> TaskRecord:
         return TaskRecord(
             task_title=draft["task_title"],
+            task_description=draft.get("task_description"),
             assigned_to=draft.get("assigned_to"),
-            assigned_date=_to_date(draft["assigned_date"]),
-            assigned_time=_to_time(draft["assigned_time"]),
-            deadline_date=_to_date(draft["deadline_date"]),
-            deadline_time=_to_time(draft["deadline_time"]),
-            status=draft["status"],
-            progress=int(draft["progress"]),
-            reminder_date=_to_date(draft["reminder_date"]),
-            reminder_time=_to_time(draft["reminder_time"]),
+            assigned_date=(
+                _to_date(draft["assigned_date"])
+                if draft.get("assigned_date")
+                else None
+            ),
+            assigned_time=(
+                _to_time(draft["assigned_time"])
+                if draft.get("assigned_time")
+                else None
+            ),
+            deadline_date=(
+                _to_date(draft["deadline_date"])
+                if draft.get("deadline_date")
+                else None
+            ),
+            deadline_time=(
+                _to_time(draft["deadline_time"])
+                if draft.get("deadline_time")
+                else None
+            ),
+            status=draft.get("status") or "PENDING",
+            progress=int(draft.get("progress") or 0),
+            reminder_date=(
+                _to_date(draft["reminder_date"])
+                if draft.get("reminder_date")
+                else None
+            ),
+            reminder_time=(
+                _to_time(draft["reminder_time"])
+                if draft.get("reminder_time")
+                else None
+            ),
         )
 
     @staticmethod

@@ -21,18 +21,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import config
 from ai.tool_calling import (
     AssistantTurn,
+    ProviderError,
+    ToolCall,
     ToolCallingClient,
+    classify_provider_error,
     default_client,
+    default_message_adapter,
+    provider_error_message,
 )
 from database import read_planner
+from database import task_fields
 from database import task_repository
 from database.models import Task
 from database.sql_execution import (
@@ -45,6 +53,7 @@ from services.conversation_memory import (
     save_conversation_memory,
     update_active_task,
 )
+from services.task_scope import current_actor
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +65,34 @@ READ_TIMEOUT_MS = 5000
 MAX_TRACE_ENTRIES = 8
 
 OPEN_STATUSES = ("PENDING", "IN_PROGRESS")
+
+
+def _log_event(event: str, **fields) -> None:
+    """Write one structured agent event without logging user content."""
+
+    clean = {key: value for key, value in fields.items() if value is not None}
+    details = " ".join(f"{key}={clean[key]}" for key in sorted(clean))
+    logger.info("%s %s", event, details, extra={"event": event, **clean})
+
+
+def _log_provider_error(error: ProviderError, *, conversation_id=None, iteration=None):
+    """Log safe provider details, including the provider trace id."""
+
+    logger.warning(
+        "Provider error: category=%s status=%s trace_id=%s detail=%s",
+        error.category,
+        error.status_code,
+        error.trace_id,
+        error.provider_detail,
+        extra={
+            "event": "provider_error",
+            "conversation_id": conversation_id,
+            "iteration": iteration,
+            "error_category": error.category,
+            "provider_status": error.status_code,
+            "provider_trace_id": error.trace_id,
+        },
+    )
 
 
 # --- tool contracts ---------------------------------------------------------
@@ -139,9 +176,10 @@ TOOL_DEFINITIONS = [
         (
             "Execute one validated INSERT, UPDATE, DELETE or DROP TABLE tasks. "
             "UPDATE, DELETE and DROP require the exact confirmation phrase from "
-            "the employee; the runtime supplies it, never the model. For an "
-            "employee-scoped UPDATE or DELETE, restrict the WHERE clause with "
-            "assigned_to and bind the employee value as a parameter."
+            "the employee; the runtime supplies it, never the model. Employees "
+            "may create tasks only for themselves and may update or delete "
+            "only their own tasks. Use named parameters and target updates and "
+            "deletes by id; never change task assignment."
         ),
         {
             "sql": {"type": "string", "description": "One write statement."},
@@ -276,6 +314,43 @@ def _schema_tool() -> dict:
 
 
 def _authorize_rows(rows: list, employee: str | None) -> tuple[list, str | None]:
+    actor = current_actor()
+
+    if actor is not None:
+        if actor.has_permission("tasks.read_all"):
+            return rows, None
+
+        allowed = []
+
+        for row in rows:
+            task_id = row.get("id")
+
+            if task_id is not None:
+                task = task_repository.get_task_for_owner(
+                    int(task_id), actor.name
+                )
+
+                if task is not None:
+                    allowed.append(row)
+                continue
+
+            if "assigned_to_employee_id" not in row:
+                return [], (
+                    "The selected columns must include "
+                    "assigned_to_employee_id so the runtime can enforce the "
+                    "employee scope."
+                )
+
+            try:
+                owned = int(row.get("assigned_to_employee_id")) == actor.id
+            except (TypeError, ValueError):
+                owned = False
+
+            if owned:
+                allowed.append(row)
+
+        return allowed, None
+
     if not employee:
         return rows, None
 
@@ -306,6 +381,390 @@ def _has_ownership_predicate(sql: str, params: dict, employee: str) -> bool:
             return True
 
     return False
+
+
+def _as_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+
+    return None
+
+
+EMPLOYEE_INSERT_COLUMNS = frozenset(
+    {
+        "task_title",
+        "task_description",
+        "assigned_to",
+        "assigned_to_employee_id",
+        "assigned_date",
+        "assigned_time",
+        "deadline_date",
+        "deadline_time",
+        "reminder_date",
+        "reminder_time",
+        "status",
+        "progress",
+    }
+)
+EMPLOYEE_UPDATE_COLUMNS = EMPLOYEE_INSERT_COLUMNS - {
+    "assigned_to",
+    "assigned_to_employee_id",
+}
+DATE_COLUMNS = frozenset(
+    {"assigned_date", "deadline_date", "reminder_date"}
+)
+TIME_COLUMNS = frozenset({"assigned_time", "deadline_time", "reminder_time"})
+ASSIGNMENT_COLUMNS = frozenset({"assigned_to", "assigned_to_employee_id"})
+
+
+def _normalise_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", (sql or "").replace('"', "")).strip().rstrip(";")
+
+
+def _split_csv(value: str) -> list[str]:
+    parts = []
+    depth = 0
+    current = []
+
+    for character in value:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+
+        current.append(character)
+
+    parts.append("".join(current).strip())
+    return parts
+
+
+def _coerce_column_value(column: str, value):
+    if value is None:
+        return None
+
+    if column in DATE_COLUMNS and not isinstance(value, date):
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            raise ValueError(f"{column} must be an ISO date.")
+
+    if column in TIME_COLUMNS and not isinstance(value, time):
+        text = str(value)
+
+        try:
+            return time.fromisoformat(text)
+        except ValueError:
+            raise ValueError(f"{column} must be an ISO time.")
+
+    if column == "assigned_to_employee_id":
+        parsed = _as_int(value)
+        if parsed is None:
+            raise ValueError("assigned_to_employee_id must be an integer.")
+        return parsed
+
+    if column == "progress":
+        parsed = _as_int(value)
+        if parsed is None:
+            raise ValueError("progress must be an integer from 0 to 100.")
+        return parsed
+
+    return value
+
+
+def _params_for_columns(columns: list[str], binds: list[str], params: dict):
+    values = {}
+
+    for column, bind in zip(columns, binds):
+        if bind is None:
+            return None, "Write values must be named parameters."
+
+        if bind not in (params or {}):
+            return None, f"The parameter :{bind} is missing."
+
+        try:
+            values[column] = _coerce_column_value(column, params[bind])
+        except ValueError as error:
+            return None, str(error)
+
+    return values, None
+
+
+def _where_task_id(where_clause: str, params: dict):
+    conditions = re.split(r"\s+AND\s+", where_clause, flags=re.IGNORECASE)
+    task_bind = None
+
+    for condition in conditions:
+        task_match = re.fullmatch(
+            r"(?:tasks\.)?id\s*=\s*:([A-Za-z_]\w*)",
+            condition.strip(),
+            re.IGNORECASE,
+        )
+        owner_match = re.fullmatch(
+            r"(?:tasks\.)?assigned_to_employee_id\s*=\s*:([A-Za-z_]\w*)",
+            condition.strip(),
+            re.IGNORECASE,
+        )
+
+        if task_match is not None and task_bind is None:
+            task_bind = task_match.group(1)
+        elif owner_match is not None:
+            continue
+        else:
+            return None, "Employees must target one task by its id."
+
+    if task_bind is None:
+        return None, "A valid task id parameter is required."
+
+    task_id = _as_int((params or {}).get(task_bind))
+
+    if task_id is None or task_id <= 0:
+        return None, "A valid task id parameter is required."
+
+    return task_id, None
+
+
+def _employee_insert(sql: str, params: dict, actor) -> dict:
+    statement = _normalise_sql(sql)
+    match = re.fullmatch(
+        r"INSERT\s+INTO\s+(?:public\.)?tasks\s*\(([^)]*)\)\s*"
+        r"VALUES\s*\(([^)]*)\)(?:\s+RETURNING\s+.*)?",
+        statement,
+        re.IGNORECASE,
+    )
+
+    if match is None:
+        return {
+            "status": "error",
+            "operation": "INSERT",
+            "message": (
+                "Use INSERT INTO tasks (columns) VALUES (:parameters) with "
+                "named parameters only."
+            ),
+        }
+
+    columns = [item.strip().lower() for item in match.group(1).split(",")]
+    value_parts = _split_csv(match.group(2))
+
+    if len(columns) != len(value_parts):
+        return {
+            "status": "error",
+            "operation": "INSERT",
+            "message": "Every inserted column needs one parameter.",
+        }
+
+    unknown = set(columns) - EMPLOYEE_INSERT_COLUMNS
+
+    if unknown:
+        return {
+            "status": "error",
+            "operation": "INSERT",
+            "message": "Only task fields can be inserted.",
+        }
+
+    binds = []
+
+    for part in value_parts:
+        match_bind = re.fullmatch(
+            r":([A-Za-z_]\w*)",
+            part.strip(),
+            re.IGNORECASE,
+        )
+
+        if match_bind is None:
+            return {
+                "status": "error",
+                "operation": "INSERT",
+                "message": "Insert values must be named parameters.",
+            }
+
+        binds.append(match_bind.group(1))
+
+    values, error = _params_for_columns(columns, binds, params)
+
+    if error:
+        return {"status": "error", "operation": "INSERT", "message": error}
+
+    from services import task_management
+
+    try:
+        task = task_management.create_task(values)
+    except task_management.TaskPermissionError as error:
+        return {"status": "error", "operation": "INSERT", "message": str(error)}
+    except task_management.TaskManagementError as error:
+        return {"status": "error", "operation": "INSERT", "message": str(error)}
+
+    return {
+        "status": "success",
+        "operation": "INSERT",
+        "task_id": task.id,
+        "task": _jsonable(
+            {
+                "id": task.id,
+                "task_title": task.task_title,
+                "assigned_to": task.assigned_to,
+                "assigned_to_employee_id": task.assigned_to_employee_id,
+                "status": task.status,
+                "progress": task.progress,
+            }
+        ),
+        "sql": sql,
+    }
+
+
+def _employee_update(sql: str, params: dict, actor) -> dict:
+    statement = _normalise_sql(sql)
+    match = re.fullmatch(
+        r"UPDATE\s+(?:public\.)?tasks\s+SET\s+(.*?)\s+WHERE\s+(.*)",
+        statement,
+        re.IGNORECASE,
+    )
+
+    if match is None:
+        return {
+            "status": "error",
+            "operation": "UPDATE",
+            "message": "Use UPDATE tasks SET column = :parameter WHERE id = :id.",
+        }
+
+    columns = []
+    binds = []
+
+    for assignment in _split_csv(match.group(1)):
+        match_assignment = re.fullmatch(
+            r"(?:tasks\.)?([A-Za-z_]\w*)\s*=\s*:([A-Za-z_]\w*)",
+            assignment.strip(),
+            re.IGNORECASE,
+        )
+
+        if match_assignment is None:
+            return {
+                "status": "error",
+                "operation": "UPDATE",
+                "message": "Update values must be named parameters.",
+            }
+
+        columns.append(match_assignment.group(1).lower())
+        binds.append(match_assignment.group(2))
+
+    if set(columns) & ASSIGNMENT_COLUMNS:
+        return {
+            "status": "error",
+            "operation": "UPDATE",
+            "message": "You cannot change task assignment.",
+        }
+
+    unknown = set(columns) - EMPLOYEE_UPDATE_COLUMNS
+
+    if unknown:
+        return {
+            "status": "error",
+            "operation": "UPDATE",
+            "message": "Only task fields can be updated.",
+        }
+
+    task_id, error = _where_task_id(match.group(2), params)
+
+    if error:
+        return {"status": "error", "operation": "UPDATE", "message": error}
+
+    values, error = _params_for_columns(columns, binds, params)
+
+    if error:
+        return {"status": "error", "operation": "UPDATE", "message": error}
+
+    from services import task_management
+
+    try:
+        task = task_management.update_task(task_id, values)
+    except task_management.TaskNotFoundError:
+        return {
+            "status": "not_found",
+            "operation": "UPDATE",
+            "message": "That task is not assigned to you.",
+        }
+    except task_management.TaskManagementError as error:
+        return {"status": "error", "operation": "UPDATE", "message": str(error)}
+
+    return {
+        "status": "success",
+        "operation": "UPDATE",
+        "task_id": task_id,
+        "task": _jsonable(
+            {
+                "id": task.id,
+                "status": task.status,
+                "progress": task.progress,
+                "assigned_to_employee_id": task.assigned_to_employee_id,
+            }
+        ),
+        "sql": sql,
+    }
+
+
+def _employee_delete(sql: str, params: dict, actor) -> dict:
+    statement = _normalise_sql(sql)
+    match = re.fullmatch(
+        r"DELETE\s+FROM\s+(?:public\.)?tasks\s+WHERE\s+(.*)",
+        statement,
+        re.IGNORECASE,
+    )
+
+    if match is None:
+        return {
+            "status": "error",
+            "operation": "DELETE",
+            "message": "Use DELETE FROM tasks WHERE id = :id.",
+        }
+
+    task_id, error = _where_task_id(match.group(1), params)
+
+    if error:
+        return {"status": "error", "operation": "DELETE", "message": error}
+
+    from services import task_management
+
+    try:
+        task_management.delete_task(task_id)
+    except task_management.TaskNotFoundError:
+        return {
+            "status": "not_found",
+            "operation": "DELETE",
+            "message": "That task is not assigned to you.",
+        }
+    except task_management.TaskManagementError as error:
+        return {"status": "error", "operation": "DELETE", "message": str(error)}
+
+    return {
+        "status": "success",
+        "operation": "DELETE",
+        "task_id": task_id,
+        "sql": sql,
+    }
+
+
+def _employee_write(sql: str, params: dict, actor, operation: str) -> dict:
+    if operation == "INSERT":
+        return _employee_insert(sql, params, actor)
+    if operation == "UPDATE":
+        return _employee_update(sql, params, actor)
+    if operation == "DELETE":
+        return _employee_delete(sql, params, actor)
+
+    return {
+        "status": "error",
+        "operation": operation,
+        "message": "Employees cannot perform this database operation.",
+    }
 
 
 def _compact_arguments(name: str, arguments: dict) -> dict:
@@ -340,22 +799,6 @@ def _trace_entry(name: str, arguments: dict, result: dict) -> dict:
     return entry
 
 
-def _latest_rows(executed: list) -> tuple[list, dict | None]:
-    rows = []
-    operation = None
-
-    for name, result in executed:
-        if result.get("status") != "success":
-            continue
-
-        candidate_rows = result.get("rows")
-        if isinstance(candidate_rows, list):
-            rows = candidate_rows
-            operation = result.get("operation")
-
-    return _jsonable(rows), operation
-
-
 def _intent_from_trace(executed: list, rows: list) -> str:
     operations = [
         result.get("operation")
@@ -377,6 +820,57 @@ def _intent_from_trace(executed: list, rows: list) -> str:
     return "GENERAL_QUERY"
 
 
+CONTROL_TOKEN = re.compile(r"<[A-Za-z0-9_]+>")
+
+
+def _clean_final_text(text: str) -> str:
+    """Remove provider control tokens and surrounding whitespace."""
+
+    cleaned = CONTROL_TOKEN.sub("", text or "")
+    lines = [line.strip() for line in cleaned.splitlines()]
+
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _direct_field_answer(ctx: ToolContext, tasks: list):
+    """Answer one requested task field directly from live task data."""
+
+    fields = task_fields.resolve_requested_fields(ctx.message)
+
+    if len(fields) != 1:
+        return None
+
+    field = fields[0]
+
+    if field == task_fields.FULL_DETAILS:
+        return None
+
+    task = tasks[0] if len(tasks) == 1 else None
+
+    if task is None:
+        active_task_id = (ctx.memory or {}).get("active_task_id")
+
+        if active_task_id is None:
+            return None
+
+        if ctx.employee:
+            task = task_repository.get_task_for_owner(
+                active_task_id, ctx.employee
+            )
+        else:
+            task = task_repository.get_task(active_task_id)
+
+        if task is None:
+            return None
+
+    try:
+        value = task_fields.format_field_value(field, task)
+    except (TypeError, ValueError):
+        return None
+
+    return field, value
+
+
 def _build_result(
     final_text: str,
     *,
@@ -385,11 +879,26 @@ def _build_result(
     ctx: ToolContext,
     iterations: int,
 ) -> dict:
-    rows, _ = _latest_rows(executed)
+    tasks = []
 
-    tasks = [row for row in rows if isinstance(row, dict)]
+    # The latest successful read rows or written task are the source of truth.
+    for _, result in executed:
+        if result.get("status") != "success":
+            continue
+
+        if isinstance(result.get("rows"), list):
+            tasks = [
+                row for row in result["rows"] if isinstance(row, dict)
+            ]
+        elif isinstance(result.get("task"), dict):
+            tasks = [result["task"]]
     task = tasks[0] if len(tasks) == 1 else None
     intent = _intent_from_trace(executed, tasks)
+    direct = (
+        _direct_field_answer(ctx, tasks)
+        if (not executed or intent == "GET_TASK")
+        else None
+    )
 
     confirmation = None
 
@@ -404,6 +913,11 @@ def _build_result(
         result.get("status") == "success" for _, result in executed
     ):
         status = "confirmation_required"
+
+    if direct is not None:
+        final_text = direct[1]
+    else:
+        final_text = _clean_final_text(final_text)
 
     if not final_text:
         if confirmation is not None:
@@ -448,11 +962,46 @@ def _build_result(
         "filters": {},
     }
 
+    if direct is not None:
+        result["requested_field"] = direct[0]
+        result["value"] = direct[1]
+
     if confirmation is not None:
         result["confirmation_phrase"] = confirmation.get("confirmation_phrase")
         result["operation"] = confirmation.get("operation")
         result["sql"] = confirmation.get("sql")
         result["params"] = confirmation.get("params")
+
+    return result
+
+
+def _build_error_result(
+    error: ProviderError,
+    *,
+    executed: list,
+    trace: list,
+    ctx: ToolContext,
+    iterations: int,
+) -> dict:
+    """A failed model turn is never reported as a successful agent result."""
+
+    text = provider_error_message(error)
+    result = _build_result(
+        text,
+        executed=executed,
+        trace=trace,
+        ctx=ctx,
+        iterations=iterations,
+    )
+
+    result["status"] = "error"
+    result["message"] = text
+    result["reply"] = text
+    result["error_category"] = error.category
+    result["agent"]["error_category"] = error.category
+
+    if error.trace_id:
+        result["agent"]["provider_trace_id"] = error.trace_id
 
     return result
 
@@ -483,6 +1032,14 @@ def _read_query(arguments: dict, ctx: ToolContext) -> dict:
         return {
             "status": "error",
             "message": "execute_read_query only accepts SELECT statements.",
+        }
+
+    actor = current_actor()
+
+    if actor is not None and not actor.has_permission("tasks.read"):
+        return {
+            "status": "error",
+            "message": "You do not have permission to read tasks.",
         }
 
     max_rows = arguments.get("max_rows", ctx.max_rows)
@@ -549,7 +1106,22 @@ def _write_query(arguments: dict, ctx: ToolContext) -> dict:
             "message": "execute_write_query does not accept SELECT statements.",
         }
 
-    if ctx.employee and validation.operation in {"UPDATE", "DELETE"}:
+    actor = current_actor()
+
+    if actor is not None:
+        required_permission = {
+            "INSERT": "tasks.create",
+            "UPDATE": "tasks.update",
+            "DELETE": "tasks.delete",
+        }.get(validation.operation)
+
+        if required_permission and not actor.has_permission(required_permission):
+            return {
+                "status": "error",
+                "message": "You do not have permission to perform this write.",
+            }
+
+    elif ctx.employee and validation.operation in {"UPDATE", "DELETE"}:
         if not _has_ownership_predicate(sql, params, ctx.employee):
             return {
                 "status": "error",
@@ -575,6 +1147,9 @@ def _write_query(arguments: dict, ctx: ToolContext) -> dict:
                 "statement."
             ),
         }
+
+    if actor is not None and not actor.has_permission("tasks.update_all"):
+        return _employee_write(sql, params, actor, validation.operation)
 
     executor = ctx.write_executor or task_repository.execute_write_sql
 
@@ -608,20 +1183,47 @@ def _context_snapshot(ctx: ToolContext) -> dict:
     if active_task_id is None:
         active_task_id = (context.get("active_task") or {}).get("id")
 
+    actor = current_actor()
     live_task = None
 
     if active_task_id is not None:
-        if ctx.employee:
+        if actor is not None:
+            live_task = task_repository.get_task_for_owner(
+                active_task_id, actor.name
+            )
+        elif ctx.employee:
             live_task = task_repository.get_task_for_owner(
                 active_task_id, ctx.employee
             )
         else:
             live_task = task_repository.get_task(active_task_id)
 
+    active_snapshot = context.get("active_task") or {}
+    candidates = context.get("candidates") or []
+
+    if actor is not None and not actor.has_permission("tasks.read_all"):
+        if live_task is None:
+            active_snapshot = {}
+
+        scoped_candidates = []
+
+        for candidate in candidates:
+            candidate_id = (candidate or {}).get("id")
+
+            if candidate_id is None:
+                continue
+
+            if task_repository.get_task_for_owner(
+                candidate_id, actor.name
+            ) is not None:
+                scoped_candidates.append(candidate)
+
+        candidates = scoped_candidates
+
     snapshot = {
         "status": "success",
         "active_task_id": active_task_id,
-        "active_task": _jsonable(context.get("active_task") or {}),
+        "active_task": _jsonable(active_snapshot),
         "live_task": _jsonable(
             {
                 column.name: getattr(live_task, column.name)
@@ -630,7 +1232,7 @@ def _context_snapshot(ctx: ToolContext) -> dict:
         )
         if live_task is not None
         else None,
-        "candidates": _jsonable(context.get("candidates") or []),
+        "candidates": _jsonable(candidates),
         "history": _jsonable(context.get("history") or []),
         "agent_trace": _jsonable(context.get("agent_trace") or []),
         "last_action": memory.get("last_action"),
@@ -720,6 +1322,66 @@ def _validate_tool(arguments: dict) -> dict:
     }
 
 
+def _tool_parameters(name: str) -> dict | None:
+    for tool in TOOL_DEFINITIONS:
+        function = tool.get("function") or {}
+
+        if function.get("name") == name:
+            return function.get("parameters") or {}
+
+    return None
+
+
+def _validate_tool_arguments(name: str, arguments: dict) -> str | None:
+    """Validate the model's arguments against the published tool schema."""
+
+    if not isinstance(arguments, dict):
+        return "Tool arguments must be an object."
+
+    if "_invalid_json" in arguments or "_invalid_arguments" in arguments:
+        return "The tool arguments are not valid JSON."
+
+    parameters = _tool_parameters(name)
+
+    if parameters is None:
+        return f"Unknown tool '{name}'."
+
+    properties = parameters.get("properties") or {}
+    required = set(parameters.get("required") or ())
+    unknown = set(arguments) - set(properties)
+
+    if unknown:
+        return "Unknown tool argument(s): " + ", ".join(sorted(unknown)) + "."
+
+    missing = [
+        key
+        for key in required
+        if key not in arguments or arguments[key] is None
+    ]
+
+    if missing:
+        return "Missing required tool argument(s): " + ", ".join(sorted(missing)) + "."
+
+    type_checks = {
+        "string": lambda value: isinstance(value, str),
+        "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
+        "object": lambda value: isinstance(value, dict),
+        "boolean": lambda value: isinstance(value, bool),
+    }
+
+    for key, value in arguments.items():
+        if value is None:
+            continue
+
+        expected = (properties.get(key) or {}).get("type")
+        check = type_checks.get(expected)
+
+        if check is not None and not check(value):
+            return f"Tool argument '{key}' must be of type {expected}."
+
+    return None
+
+
 def execute_tool(name: str, arguments: dict, ctx: ToolContext) -> dict:
     handler = TOOL_HANDLERS.get(name)
 
@@ -728,6 +1390,11 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext) -> dict:
 
     if not isinstance(arguments, dict):
         return {"status": "error", "message": "Tool arguments must be an object."}
+
+    argument_error = _validate_tool_arguments(name, arguments)
+
+    if argument_error:
+        return {"status": "error", "message": argument_error}
 
     try:
         return handler(arguments, ctx)
@@ -742,20 +1409,37 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext) -> dict:
 # --- prompt and loop --------------------------------------------------------
 
 
-def _system_prompt(ctx: ToolContext) -> str:
+def _system_prompt(ctx: ToolContext, model_tools: list | None = None) -> str:
     memory = ctx.memory or {}
     context = memory.get("context") or {}
     active = context.get("active_task") or {}
     candidates = context.get("candidates") or []
     trace = context.get("agent_trace") or []
 
-    scope = (
-        f"The signed-in employee is {ctx.employee}. Every read must stay in "
-        "their rows. Select assigned_to and bind the employee value in an "
-        "assigned_to ILIKE predicate."
-        if ctx.employee
-        else "No employee scope was supplied; the request is not restricted."
-    )
+    actor = current_actor()
+
+    if actor is not None and actor.has_permission("tasks.read_all"):
+        scope = (
+            f"The signed-in employee is {actor.name}. They may read tasks "
+            "across the organisation."
+        )
+    elif actor is not None:
+        scope = (
+            f"The signed-in employee is {actor.name} (employee id {actor.id}). "
+            "Every read must stay in their rows: select assigned_to and "
+            "assigned_to_employee_id and bind an assigned_to_employee_id "
+            "predicate to their employee id. They may create tasks only for "
+            "themselves, edit their own task fields (not assignment) and "
+            "delete their own tasks."
+        )
+    elif ctx.employee:
+        scope = (
+            f"The signed-in employee is {ctx.employee}. Every read must stay "
+            "in their rows. Select assigned_to and bind the employee value in "
+            "an assigned_to ILIKE predicate."
+        )
+    else:
+        scope = "No employee scope was supplied; the request is not restricted."
 
     return f"""
 You are the task database agent of a task-management application. You are the
@@ -768,6 +1452,8 @@ Only the `tasks` table may be referenced. The schema is:
 
 Current time: {datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M")} ({TIMEZONE}).
 {scope}
+
+Available tools: {", ".join(_tool_names(model_tools or [])) or "none"}.
 
 Conversation context:
 - active task snapshot: {json.dumps(_jsonable(active), default=str)}
@@ -797,10 +1483,10 @@ Rules:
    progress -> "40% completed."; status -> "PENDING."; deadline ->
    "25 November 2026." Use DD Month YYYY for dates.
 9. If a field is NULL, say it is not set. If no task matches, say so.
-10. Writes: INSERT needs no confirmation. UPDATE, DELETE and DROP TABLE tasks
-    are executed only when the employee supplied the exact phrase. If a write
-    tool returns confirmation_required, tell the employee the exact phrase and
-    do not claim it ran. Never supply or guess the confirmation phrase.
+10. Writes: task creation needs no confirmation. Task updates and deletes are
+    executed only when the employee supplied the exact phrase. If a write tool
+    returns confirmation_required, tell the employee the exact phrase and do
+    not claim it ran. Never supply or guess the confirmation phrase.
 11. Never print raw SQL or JSON to the employee. Answer in short, natural
     language.
 12. Stop as soon as the answer is known. Do not call a tool when the context
@@ -809,6 +1495,19 @@ Rules:
 Use the native tools. Return a final natural-language answer only when no
 further tool call is needed.
 """.strip()
+
+
+def _tool_names(model_tools: list) -> list[str]:
+    names = []
+
+    for tool in model_tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = (function or {}).get("name")
+
+        if name:
+            names.append(str(name))
+
+    return names
 
 
 def _history_messages(ctx: ToolContext) -> list[dict]:
@@ -879,10 +1578,10 @@ def run_database_agent(
 ) -> dict | None:
     """Run the bounded LLM/tool loop for one turn.
 
-    Returns ``None`` when the agent is disabled or cannot start, so the caller
-    can keep the deterministic flow. Once a tool has run, a failure is returned
-    as a normal error result instead of falling back, because a fallback could
-    repeat a write.
+    ``None`` means the agent is disabled or could not start. Once the loop has
+    started, a provider failure is returned as an error result instead of a
+    successful turn. The dynamic LLM tool selection is never replaced by a
+    keyword or branch-based workflow.
     """
 
     if client is None:
@@ -903,8 +1602,27 @@ def run_database_agent(
         read_executor=read_executor,
         write_executor=write_executor,
     )
+    adapter = default_message_adapter(client)
+    conversation = ctx.conversation
 
-    messages = [{"role": "system", "content": _system_prompt(ctx)}]
+    model_tools = TOOL_DEFINITIONS
+
+    if hasattr(client, "tool_definitions"):
+        try:
+            model_tools = client.tool_definitions()
+        except Exception as error:
+            provider_error = classify_provider_error(error)
+            logger.warning("MCP tool discovery failed: %s", provider_error)
+            ctx.tool_trace = []
+            return _build_error_result(
+                provider_error,
+                executed=[],
+                trace=[],
+                ctx=ctx,
+                iterations=0,
+            )
+
+    messages = [{"role": "system", "content": _system_prompt(ctx, model_tools)}]
     messages.extend(_history_messages(ctx))
     messages.append({"role": "user", "content": message})
 
@@ -913,29 +1631,87 @@ def run_database_agent(
     seen = set()
     limit = max_iterations or _max_iterations()
 
+    _log_event(
+        "agent_turn_started",
+        conversation_id=conversation,
+        max_iterations=limit,
+    )
+
     for iteration in range(1, limit + 1):
+        started = monotonic()
+
         try:
             turn: AssistantTurn = client.chat(
-                messages=messages, tools=TOOL_DEFINITIONS
+                messages=messages, tools=model_tools
             )
         except Exception as error:
-            logger.exception("The database agent model call failed.")
+            provider_error = classify_provider_error(error)
+            duration_ms = round((monotonic() - started) * 1000)
+
+            _log_event(
+                "model_request",
+                conversation_id=conversation,
+                iteration=iteration,
+                status="error",
+                duration_ms=duration_ms,
+                error_category=provider_error.category,
+            )
+            _log_provider_error(
+                provider_error,
+                conversation_id=conversation,
+                iteration=iteration,
+            )
+
             ctx.tool_trace = trace
+            result = _build_error_result(
+                provider_error,
+                executed=executed,
+                trace=trace,
+                ctx=ctx,
+                iterations=iteration,
+            )
 
-            if executed:
-                return _build_result(
-                    f"I could not finish the request: {error}",
-                    executed=executed,
-                    trace=trace,
-                    ctx=ctx,
-                    iterations=iteration,
+            _log_event(
+                "final_response",
+                conversation_id=conversation,
+                iteration=iteration,
+                status="error",
+                final_status=result.get("status"),
+                tool_count=len(executed),
+                error_category=provider_error.category,
+            )
+
+            return result
+
+        _log_event(
+            "model_request",
+            conversation_id=conversation,
+            iteration=iteration,
+            status="success",
+            duration_ms=round((monotonic() - started) * 1000),
+        )
+
+        # Normalize the ids once, so every tool result refers to exactly the
+        # assistant call it answers. Provider ids are preserved.
+        calls = []
+
+        for index, call in enumerate(turn.tool_calls or [], start=1):
+            call_id = str(call.id or "").strip() or (
+                f"agent-call-{iteration}-{index}"
+            )
+            calls.append(
+                ToolCall(
+                    id=call_id,
+                    name=str(call.name or "").strip(),
+                    arguments=call.arguments,
                 )
+            )
 
-            return None
+        turn.tool_calls = calls
 
         if not turn.tool_calls:
             ctx.tool_trace = trace
-            return _build_result(
+            result = _build_result(
                 turn.content.strip(),
                 executed=executed,
                 trace=trace,
@@ -943,13 +1719,27 @@ def run_database_agent(
                 iterations=iteration,
             )
 
-        messages.append(turn.as_message())
+            _log_event(
+                "final_response",
+                conversation_id=conversation,
+                iteration=iteration,
+                status="success",
+                final_status=result.get("status"),
+                tool_count=len(executed),
+            )
+
+            return result
+
+        # Only the provider-safe fields are serialized. Internal metadata
+        # such as Cohere's tool_plan stays out of the request.
+        messages.append(adapter.assistant_message(turn))
 
         for call in turn.tool_calls:
             signature = (
                 call.name,
                 json.dumps(call.arguments or {}, sort_keys=True, default=str),
             )
+            tool_started = monotonic()
 
             if signature in seen:
                 result = {
@@ -961,26 +1751,49 @@ def run_database_agent(
                 }
             else:
                 seen.add(signature)
-                result = execute_tool(call.name, call.arguments, ctx)
+
+                if hasattr(client, "call_tool"):
+                    result = client.call_tool(
+                        call.name,
+                        call.arguments,
+                        trusted_confirmation=ctx.confirmation,
+                    )
+                else:
+                    result = execute_tool(call.name, call.arguments, ctx)
+
                 executed.append((call.name, result))
+
+            duration_ms = round((monotonic() - tool_started) * 1000)
+
+            _log_event(
+                "tool_execution",
+                conversation_id=conversation,
+                iteration=iteration,
+                tool=call.name or "unknown",
+                duration_ms=duration_ms,
+                status=result.get("status"),
+            )
 
             trace.append(_trace_entry(call.name, call.arguments, result))
             ctx.tool_trace = trace
 
             messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": json.dumps(_jsonable(result), default=str),
-                }
+                adapter.tool_message(call, _jsonable(result))
             )
 
     ctx.tool_trace = trace
 
     if not executed:
+        _log_event(
+            "final_response",
+            conversation_id=conversation,
+            status="success",
+            final_status="not_started",
+            tool_count=0,
+        )
         return None
 
-    return _build_result(
+    result = _build_result(
         (
             "I could not finish that request within the allowed number of "
             "steps. Please make the request a little more specific."
@@ -990,3 +1803,13 @@ def run_database_agent(
         ctx=ctx,
         iterations=limit,
     )
+
+    _log_event(
+        "final_response",
+        conversation_id=conversation,
+        status="success",
+        final_status=result.get("status"),
+        tool_count=len(executed),
+    )
+
+    return result

@@ -38,7 +38,9 @@ DATE_COLUMNS = frozenset(
 TIME_COLUMNS = frozenset(
     {"assigned_time", "deadline_time", "reminder_time"}
 )
-TEXT_COLUMNS = frozenset({"task_title", "assigned_to", "status"})
+TEXT_COLUMNS = frozenset(
+    {"task_title", "task_description", "assigned_to", "status"}
+)
 INTEGER_COLUMNS = frozenset({"id", "progress"})
 
 ALLOWED_OPERATORS = frozenset(

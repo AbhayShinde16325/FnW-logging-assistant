@@ -1,0 +1,25 @@
+config_version: 1
+control_plane:
+  base_url: "https://api.openai.com"
+  tunnel_id: "tunnel_6afffbc6d9448191948efa4eedd118d4"
+  api_key: "env:CONTROL_PLANE_API_KEY"
+health:
+  listen_addr: "127.0.0.1:8080"
+admin_ui:
+  open_browser: false
+log:
+  level: info
+  format: json
+mcp:
+  # Inject the dedicated FnW MCP credential for upstream MCP requests.
+  # The mounted file contains the full "Bearer fnw_mcp_..." value.
+  # tunnel-client v0.0.20 resolves file: refs only when the header value is the
+  # ref itself. Entrypoint copies the mounted secret to a tunnel-readable path.
+  extra_headers:
+    Authorization: "file:/tmp/fnw-mcp-authorization"
+  discovery_extra_headers:
+    Authorization: "file:/tmp/fnw-mcp-authorization"
+  server_urls:
+    - channel: main
+      # Docker-internal MCP endpoint; do not use localhost/127.0.0.1 here.
+      url: "http://backend:8000/mcp/"

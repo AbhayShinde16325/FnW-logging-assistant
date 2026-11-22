@@ -29,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from database.connection import SessionLocal
 from database.models import ConversationMemory
 from database.task_repository import get_task, get_task_for_owner
+from services.task_scope import current_actor
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,14 @@ MAX_HISTORY_ENTRIES = 10
 # so the context stays small.
 MAX_TURN_LENGTH = 400
 
+# A sentinel so an omitted feedback value never overwrites a stored one.
+_UNSET = object()
+
 # The fields of a task that are worth remembering.
 TASK_SNAPSHOT_FIELDS = (
     "id",
     "task_title",
+    "task_description",
     "assigned_to",
     "status",
     "progress",
@@ -59,10 +64,26 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _actor_employee_id() -> int | None:
+    actor = current_actor()
+    return actor.id if actor is not None else None
+
+
 def _clean(value) -> str | None:
     text = str(value).strip() if value is not None else ""
 
     return text or None
+
+
+def _scoped_user_id(user_id) -> str | None:
+    """Use the authenticated employee's id, never a caller-supplied value."""
+
+    employee_id = _actor_employee_id()
+
+    if employee_id is not None:
+        return f"employee:{employee_id}"
+
+    return _clean(user_id)
 
 
 def _iso(value: datetime | None = None) -> str:
@@ -152,6 +173,7 @@ def _snapshot(memory: ConversationMemory) -> dict:
         "user_id": memory.user_id,
         "active_task_id": memory.active_task_id,
         "last_action": memory.last_action,
+        "response_feedback": memory.response_feedback,
         "context": {
             **dict(memory.context or {}),
             "history": recent_messages(
@@ -184,7 +206,7 @@ def get_conversation_memory(user_id, conversation_id) -> dict | None:
     the conversation simply starts without a context.
     """
 
-    user = _clean(user_id)
+    user = _scoped_user_id(user_id)
     conversation = _clean(conversation_id)
 
     if not user or not conversation:
@@ -209,6 +231,7 @@ def save_conversation_memory(
     last_action: str | None = None,
     context: dict | None = None,
     clear_active_task: bool = False,
+    response_feedback=_UNSET,
 ) -> dict | None:
     """Create the memory of a conversation, or update the stored one.
 
@@ -216,7 +239,7 @@ def save_conversation_memory(
     than one memory per user and conversation.
     """
 
-    user = _clean(user_id)
+    user = _scoped_user_id(user_id)
     conversation = _clean(conversation_id)
 
     if not user or not conversation:
@@ -231,12 +254,21 @@ def save_conversation_memory(
             memory = ConversationMemory(
                 user_id=user,
                 conversation_id=conversation,
+                employee_id=_actor_employee_id(),
                 active_task_id=active_task_id,
                 last_action=last_action,
                 context=dict(context or {}),
+                response_feedback=(
+                    None
+                    if response_feedback is _UNSET
+                    else response_feedback
+                ),
             )
             session.add(memory)
         else:
+            if memory.employee_id is None:
+                memory.employee_id = _actor_employee_id()
+
             if clear_active_task:
                 memory.active_task_id = None
             elif active_task_id is not None:
@@ -249,6 +281,9 @@ def save_conversation_memory(
                 merged = dict(memory.context or {})
                 merged.update(context)
                 memory.context = merged
+
+            if response_feedback is not _UNSET:
+                memory.response_feedback = response_feedback
 
         memory.updated_at = _utcnow()
 
@@ -279,6 +314,9 @@ def save_conversation_memory(
             merged.update(context)
             memory.context = merged
 
+        if response_feedback is not _UNSET:
+            memory.response_feedback = response_feedback
+
         memory.updated_at = _utcnow()
 
         session.commit()
@@ -292,6 +330,24 @@ def save_conversation_memory(
 
     finally:
         session.close()
+
+
+def update_response_feedback(user_id, conversation_id, feedback):
+    """Store a new rating for the conversation without touching its context.
+
+    ``True`` is a thumbs up, ``False`` is a thumbs down. The row is looked up
+    by ``user_id`` and ``conversation_id``, so a rating is always written to
+    the memory of the conversation it belongs to.
+    """
+
+    if not isinstance(feedback, bool):
+        return None
+
+    return save_conversation_memory(
+        user_id,
+        conversation_id,
+        response_feedback=feedback,
+    )
 
 
 def update_active_task(
@@ -312,7 +368,7 @@ def update_active_task(
     clears the active task.
     """
 
-    user = _clean(user_id)
+    user = _scoped_user_id(user_id)
     conversation = _clean(conversation_id)
 
     if not user or not conversation:
@@ -328,9 +384,12 @@ def update_active_task(
         )
 
     known = task
+    actor = current_actor()
 
-    if employee:
-        # The ownership of the employee is always checked in the database.
+    if actor is not None:
+        # Authenticated ownership is always re-read from the database.
+        known = get_task_for_owner(task_id, actor.name)
+    elif employee:
         known = get_task_for_owner(task_id, employee)
     elif known is None:
         known = get_task(task_id)
@@ -381,7 +440,7 @@ def append_history(user_id, conversation_id, turns: list) -> dict | None:
     never grows into a full transcript.
     """
 
-    user = _clean(user_id)
+    user = _scoped_user_id(user_id)
     conversation = _clean(conversation_id)
 
     if not user or not conversation:
@@ -396,6 +455,7 @@ def append_history(user_id, conversation_id, turns: list) -> dict | None:
             memory = ConversationMemory(
                 user_id=user,
                 conversation_id=conversation,
+                employee_id=_actor_employee_id(),
                 context={},
             )
             session.add(memory)
@@ -449,7 +509,7 @@ def clear_conversation_memory(user_id, conversation_id) -> bool:
     ``True`` is returned when a memory was removed.
     """
 
-    user = _clean(user_id)
+    user = _scoped_user_id(user_id)
     conversation = _clean(conversation_id)
 
     if not user or not conversation:

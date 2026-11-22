@@ -357,26 +357,17 @@ def test_create_inserts_exactly_one_record(client, db, monkeypatch):
             "confirm": True,
         },
     )
-    draft = response.json()["draft"]
+
+    reminder = response.json()
+    assert reminder["status"] == "reminder_required"
+    assert reminder["stage"] == "reminder"
 
     response = client.post(
         "/tasks/text",
         json={
-            "text": "Rahul has a Python API research task",
-            "stage": "reminder",
-            "draft": draft,
-            "reminder_text": "30 minutes before the deadline",
-        },
-    )
-    draft = response.json()["draft"]
-
-    response = client.post(
-        "/tasks/text",
-        json={
-            "text": "Rahul has a Python API research task",
-            "stage": "confirm_reminder",
-            "draft": draft,
-            "confirm": True,
+            "text": "no reminder",
+            "stage": reminder["stage"],
+            "draft": reminder["draft"],
         },
     )
 
@@ -801,10 +792,11 @@ def test_conversation_context_is_preserved_across_turns(client, db, monkeypatch)
         json={"message": "Rahul has a Python API research task"},
     ).json()
 
-    assert first["stage"] == "fields"
-    assert first["missing_fields"] == ["status"]
+    assert first["stage"] == "confirm_fields"
+    assert first["missing_fields"] == []
     draft = first["draft"]
     assert draft["task_title"] == "Python API research"
+    assert draft["task_description"] == "Summarise the API findings"
 
     second = client.post(
         "/tasks/chat",
@@ -818,10 +810,11 @@ def test_conversation_context_is_preserved_across_turns(client, db, monkeypatch)
     assert second["stage"] == "confirm_fields"
     assert second["draft"]["status"] == "IN_PROGRESS"
     assert second["draft"]["task_title"] == "Python API research"
+    assert second["draft"]["task_description"] == "Summarise the API findings"
     assert second["draft"]["progress"] == 50
     draft = second["draft"]
 
-    third = client.post(
+    reminder = client.post(
         "/tasks/chat",
         json={
             "message": "yes",
@@ -830,34 +823,23 @@ def test_conversation_context_is_preserved_across_turns(client, db, monkeypatch)
         },
     ).json()
 
-    assert third["stage"] == "reminder"
-    draft = third["draft"]
-
-    fourth = client.post(
-        "/tasks/chat",
-        json={
-            "message": "30 minutes before the deadline",
-            "stage": third["stage"],
-            "draft": draft,
-        },
-    ).json()
-
-    assert fourth["stage"] == "confirm_reminder"
-    draft = fourth["draft"]
+    assert reminder["status"] == "reminder_required"
+    assert reminder["stage"] == "reminder"
 
     final = client.post(
         "/tasks/chat",
         json={
-            "message": "yes",
-            "stage": fourth["stage"],
-            "draft": draft,
+            "message": "no reminder",
+            "stage": reminder["stage"],
+            "draft": reminder["draft"],
         },
     ).json()
 
     assert final["status"] == "success"
     assert db.inserts == 1
     assert db.tasks[0]["status"] == "IN_PROGRESS"
-    assert db.tasks[0]["reminder_date"].isoformat() == "2026-11-15"
+    assert db.tasks[0]["task_description"] == "Summarise the API findings"
+    assert db.tasks[0]["reminder_date"] is None
 
 
 def test_ambiguous_update_keeps_the_context_for_the_next_turn(client, db, monkeypatch):

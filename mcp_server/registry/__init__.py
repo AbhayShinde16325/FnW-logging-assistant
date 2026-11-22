@@ -1,0 +1,1 @@
+"""Central MCP tool registry."""

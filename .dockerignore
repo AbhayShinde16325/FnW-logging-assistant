@@ -36,3 +36,6 @@ frontend
 .DS_Store
 .vscode
 .idea
+
+# MCP tunnel local secrets are mounted/provided at runtime (never in image context)
+tunnel/secrets

@@ -1,0 +1,93 @@
+const API = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(
+  /\/$/,
+  ""
+);
+
+export const API_BASE = API;
+export const AUTH_ME_API = `${API}/auth/me`;
+export const AUTH_REFRESH_API = `${API}/auth/refresh`;
+export const AUTH_LOGIN_API = `${API}/auth/google/login`;
+export const AUTH_LOGOUT_API = `${API}/auth/logout`;
+export const AUTH_LOGOUT_ALL_API = `${API}/auth/logout-all`;
+
+export function readCookie(name) {
+  if (typeof document === "undefined") return "";
+
+  const prefix = `${name}=`;
+  const match = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+
+  return match ? decodeURIComponent(match.slice(prefix.length)) : "";
+}
+
+const csrfHeaders = () => {
+  const token = readCookie("taskflow_csrf");
+  return token ? { "X-CSRF-Token": token } : {};
+};
+
+export async function beginGoogleLogin(returnTo = window.location.href) {
+  const response = await fetch(
+    `${AUTH_LOGIN_API}?return_to=${encodeURIComponent(returnTo)}`,
+    { credentials: "include" }
+  );
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data.authorization_url) {
+    throw new Error(data.detail || "Google sign-in is not available.");
+  }
+
+  window.location.assign(data.authorization_url);
+}
+
+const REFRESH_LOCK_NAME = "taskflow-refresh-session";
+
+async function postRefreshRequest() {
+  const response = await fetch(AUTH_REFRESH_API, {
+    method: "POST",
+    credentials: "include",
+    headers: csrfHeaders(),
+  });
+  const data = await response.json().catch(() => ({}));
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data,
+  };
+}
+
+export async function refreshSessionRequest() {
+  if (typeof navigator !== "undefined" && navigator.locks?.request) {
+    return navigator.locks.request(REFRESH_LOCK_NAME, () =>
+      postRefreshRequest()
+    );
+  }
+
+  return postRefreshRequest();
+}
+
+export async function logoutRequest(accessToken, allSessions = false) {
+  const url = allSessions ? AUTH_LOGOUT_ALL_API : AUTH_LOGOUT_API;
+
+  await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      ...csrfHeaders(),
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+  }).catch(() => {});
+}
+
+export function authErrorMessage(code) {
+  const messages = {
+    google_cancelled: "Google sign-in was cancelled.",
+    google_verification_failed: "Google could not verify your identity.",
+    not_provisioned:
+      "Your Google account is not provisioned. Ask an administrator to add your work email.",
+  };
+
+  return messages[code] || "Sign-in could not be completed.";
+}

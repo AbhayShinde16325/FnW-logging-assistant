@@ -1,9 +1,123 @@
+import logging
+import re
+
 from sqlalchemy import or_, text
 
 from database import search as task_search
 from database.connection import SessionLocal
-from database.models import Task
+from database.models import Employee, Task
 from database.sql_execution import SqlAlchemyConnection, execute_operation, execute_sql
+from services import notification_service
+from services.task_scope import current_actor, query_scope
+
+logger = logging.getLogger(__name__)
+
+REMINDER_IMPACTING_FIELDS = frozenset(
+    {
+        "reminder_date",
+        "reminder_time",
+        "deadline_date",
+        "deadline_time",
+        "assigned_to",
+        "assigned_to_employee_id",
+        "status",
+    }
+)
+
+
+def _cancel_reminders_for_change(task_id, updates) -> None:
+    if task_id is None:
+        return
+
+    updates = updates or {}
+    completed = str(updates.get("status") or "").upper() in {
+        "COMPLETED",
+        "CANCELLED",
+    }
+
+    if not completed and not (set(updates) & REMINDER_IMPACTING_FIELDS):
+        if updates.get("progress") != 100:
+            return
+
+    try:
+        notification_service.cancel_pending_notifications(
+            int(task_id),
+            reason="The task changed before the reminder was delivered.",
+        )
+    except Exception:
+        logger.exception(
+            "Could not cancel pending reminders for task %s.", task_id
+        )
+
+
+def _operation_label(operation) -> str:
+    """The operation label of a structured operation or a plain string."""
+
+    if isinstance(operation, dict):
+        value = operation.get("operation")
+    elif isinstance(operation, str):
+        value = operation
+    else:
+        return ""
+
+    return str(value or "").strip().upper().replace("_", " ")
+
+
+def _updated_columns(sql) -> list[str]:
+    """The columns assigned by a validated ``UPDATE ... SET`` statement.
+
+    Used only to decide whether pending reminders must be cancelled. The
+    statement itself is still executed by the shared validation layer.
+    """
+
+    match = re.search(
+        r"\bset\b(.*?)(?:\bwhere\b|\breturning\b|;|$)",
+        sql or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    if match is None:
+        return []
+
+    columns = []
+
+    for assignment in match.group(1).split(","):
+        name = assignment.split("=", 1)[0].strip().replace('"', "")
+        name = name.rsplit(".", 1)[-1].strip().lower()
+
+        if re.fullmatch(r"[a-z_][a-z0-9_]*", name):
+            columns.append(name)
+
+    return columns
+
+
+def _write_side_effects(operation, sql, params) -> None:
+    """Cancel stale reminders after a successful write.
+
+    ``operation`` may be the structured operation produced by
+    ``database.sql_generator`` or the operation label passed by the database
+    agent. A plain label never carries the task id or the changed columns, so
+    they are read from the bound parameters and the validated statement.
+    """
+
+    label = _operation_label(operation)
+    params = params or {}
+
+    if isinstance(operation, dict):
+        task_id = operation.get("task_id")
+        updates = operation.get("updates") or {}
+    else:
+        task_id = params.get("task_id", params.get("id"))
+        updates = (
+            {name: params.get(name) for name in _updated_columns(sql)}
+            if label == "UPDATE"
+            else {}
+        )
+
+    if label == "DELETE":
+        _cancel_reminders_for_change(task_id, {"status": "CANCELLED"})
+    elif label == "UPDATE":
+        _cancel_reminders_for_change(task_id, updates)
 
 
 def run_sql_operation(operation, *, confirmation=None):
@@ -28,6 +142,13 @@ def run_sql_operation(operation, *, confirmation=None):
 
         if result.get("status") == "success":
             db.commit()
+
+            if operation and operation.get("table") == "tasks":
+                _write_side_effects(
+                    operation,
+                    operation.get("sql"),
+                    operation.get("params"),
+                )
         else:
             db.rollback()
 
@@ -119,6 +240,7 @@ def execute_write_sql(
 
         if result.get("status") == "success":
             db.commit()
+            _write_side_effects(operation, sql, params)
         else:
             db.rollback()
 
@@ -142,6 +264,32 @@ def create_task(task_details):
             task_data = task_details.model_dump()
         else:
             task_data = dict(task_details)
+
+        actor = current_actor()
+
+        if actor is not None:
+            task_data.setdefault("created_by_employee_id", actor.id)
+
+            if not actor.has_permission("tasks.update_all"):
+                # Defense in depth: even a repository caller cannot insert a
+                # task for somebody else on behalf of an employee.
+                task_data["assigned_to_employee_id"] = actor.id
+                task_data["assigned_to"] = actor.name
+                task_data["created_by_employee_id"] = actor.id
+
+            elif not task_data.get("assigned_to_employee_id"):
+                assigned_name = (task_data.get("assigned_to") or "").strip()
+
+                if assigned_name:
+                    assignees = db.query(Employee).filter(
+                        Employee.name.ilike(assigned_name),
+                        Employee.is_active.is_(True),
+                    ).limit(2).all()
+
+                    if len(assignees) == 1:
+                        task_data["assigned_to_employee_id"] = assignees[0].id
+                    elif assigned_name.lower() == actor.name.lower():
+                        task_data["assigned_to_employee_id"] = actor.id
 
         # Ignore keys that have no matching column so the caller can pass
         # forward-compatible data without breaking the insert.
@@ -172,9 +320,8 @@ def get_task(task_id):
     db = SessionLocal()
 
     try:
-        return db.query(Task).filter(
-            Task.id == task_id
-        ).first()
+        query = db.query(Task).filter(Task.id == task_id)
+        return query_scope(query).first()
 
     finally:
         db.close()
@@ -185,7 +332,8 @@ def get_all_tasks():
     db = SessionLocal()
 
     try:
-        return db.query(Task).order_by(Task.id).all()
+        query = query_scope(db.query(Task))
+        return query.order_by(Task.id).all()
 
     finally:
         db.close()
@@ -218,7 +366,7 @@ def search_tasks(
     db = SessionLocal()
 
     try:
-        tasks = db.query(Task)
+        tasks = query_scope(db.query(Task))
 
         if task_id is not None:
             tasks = tasks.filter(Task.id == task_id)
@@ -231,7 +379,7 @@ def search_tasks(
                 Task.assigned_to.ilike(f"%{assigned_to.strip()}%")
             )
 
-        if owner:
+        if owner and current_actor() is None:
             tasks = tasks.filter(Task.assigned_to.ilike(owner.strip()))
 
         text = task_title or query
@@ -313,9 +461,9 @@ def get_task_field(task_id, field, *, owner=None):
     db = SessionLocal()
 
     try:
-        query = db.query(Task).filter(Task.id == task_id)
+        query = query_scope(db.query(Task)).filter(Task.id == task_id)
 
-        if owner:
+        if owner and current_actor() is None:
             query = query.filter(Task.assigned_to.ilike(owner.strip()))
 
         task = query.first()
@@ -335,9 +483,9 @@ def get_task_for_owner(task_id, employee):
     db = SessionLocal()
 
     try:
-        query = db.query(Task).filter(Task.id == task_id)
+        query = query_scope(db.query(Task)).filter(Task.id == task_id)
 
-        if employee:
+        if employee and current_actor() is None:
             query = query.filter(Task.assigned_to.ilike(employee.strip()))
 
         return query.first()
@@ -360,7 +508,7 @@ def find_identical_task(
     db = SessionLocal()
 
     try:
-        query = db.query(Task).filter(
+        query = query_scope(db.query(Task)).filter(
             Task.task_title.ilike(task_title.strip())
         )
 
@@ -384,7 +532,7 @@ def count_tasks() -> int:
     db = SessionLocal()
 
     try:
-        return db.query(Task).count()
+        return query_scope(db.query(Task)).count()
 
     finally:
         db.close()
@@ -401,9 +549,9 @@ def update_task(task_id, updates, *, owner=None):
     db = SessionLocal()
 
     try:
-        query = db.query(Task).filter(Task.id == task_id)
+        query = query_scope(db.query(Task), write=True).filter(Task.id == task_id)
 
-        if owner:
+        if owner and current_actor() is None:
             query = query.filter(Task.assigned_to.ilike(owner.strip()))
 
         task = query.first()
@@ -422,6 +570,8 @@ def update_task(task_id, updates, *, owner=None):
         db.commit()
         db.refresh(task)
 
+        _cancel_reminders_for_change(task_id, updates)
+
         return task
 
     except Exception:
@@ -438,9 +588,9 @@ def delete_task(task_id, *, owner=None):
     db = SessionLocal()
 
     try:
-        query = db.query(Task).filter(Task.id == task_id)
+        query = query_scope(db.query(Task), write=True).filter(Task.id == task_id)
 
-        if owner:
+        if owner and current_actor() is None:
             query = query.filter(Task.assigned_to.ilike(owner.strip()))
 
         task = query.first()
@@ -450,6 +600,8 @@ def delete_task(task_id, *, owner=None):
 
         db.delete(task)
         db.commit()
+
+        _cancel_reminders_for_change(task_id, {"status": "CANCELLED"})
 
         return True
 

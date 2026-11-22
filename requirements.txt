@@ -10,3 +10,8 @@ faster-whisper
 tzdata
 pytest
 httpx
+alembic
+PyJWT[crypto]
+
+pywebpush>=2.0,<3
+mcp>=1.30,<2

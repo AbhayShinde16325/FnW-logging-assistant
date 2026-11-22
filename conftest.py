@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+
+# The existing suite drives the task API without browser sessions. Auth has
+# its own tests that enable the production mode explicitly.
+os.environ.setdefault("AUTH_REQUIRED", "0")
+os.environ.setdefault(
+    "AUTH_SECRET_KEY", "test-only-secret-key-that-is-long-enough-123"
+)
 
 from ai.query_session import TaskDraftEngine
 

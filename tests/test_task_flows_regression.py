@@ -118,6 +118,7 @@ class ScriptedUpdateExtractor:
 def create_extraction(**overrides) -> ExtractionResult:
     values = {
         "task_title": "Back-end optimization technique",
+        "task_description": "A faster API response path",
         "assigned_to": "RAM",
         "assigned_when": "10 November 2026 at 10:30 AM",
         "deadline_when": "15 November 2026 at 5 PM",
@@ -171,8 +172,9 @@ def test_create_message_starts_a_new_task(client, db, monkeypatch):
     first = client.post("/tasks/chat", json={"message": CREATE_MESSAGE}).json()
 
     assert first["intent"] == "CREATE_TASK"
-    assert first["stage"] == "fields"
+    assert first["stage"] == "confirm_fields"
     assert first["draft"]["task_title"] == "Back-end optimization technique"
+    assert first["draft"]["task_description"] == "A faster API response path"
     assert first["draft"]["assigned_to"] == "RAM"
     # no task was looked up and nothing was written yet
     assert "search_tasks" not in db.calls
@@ -188,8 +190,9 @@ def test_create_message_starts_a_new_task(client, db, monkeypatch):
     ).json()
 
     assert second["stage"] == "confirm_fields"
+    assert second["draft"]["status"] == "IN_PROGRESS"
 
-    third = client.post(
+    reminder = client.post(
         "/tasks/chat",
         json={
             "message": "yes",
@@ -198,25 +201,15 @@ def test_create_message_starts_a_new_task(client, db, monkeypatch):
         },
     ).json()
 
-    assert third["stage"] == "reminder"
-
-    fourth = client.post(
-        "/tasks/chat",
-        json={
-            "message": "30 minutes before the deadline",
-            "stage": third["stage"],
-            "draft": third["draft"],
-        },
-    ).json()
-
-    assert fourth["stage"] == "confirm_reminder"
+    assert reminder["status"] == "reminder_required"
+    assert reminder["stage"] == "reminder"
 
     final = client.post(
         "/tasks/chat",
         json={
-            "message": "yes",
-            "stage": fourth["stage"],
-            "draft": fourth["draft"],
+            "message": "no reminder",
+            "stage": reminder["stage"],
+            "draft": reminder["draft"],
         },
     ).json()
 
@@ -229,6 +222,7 @@ def test_create_message_starts_a_new_task(client, db, monkeypatch):
     assert db.updates == 0
     assert db.deletes == 0
     assert db.tasks[0]["task_title"] == "Back-end optimization technique"
+    assert db.tasks[0]["task_description"] == "A faster API response path"
     assert db.tasks[0]["assigned_to"] == "RAM"
     assert db.tasks[0]["status"] == "IN_PROGRESS"
 
@@ -249,7 +243,7 @@ def test_create_message_does_not_look_a_task_up(client, db, monkeypatch):
     body = response.json()
 
     assert body["intent"] == "CREATE_TASK"
-    assert body["stage"] == "fields"
+    assert body["stage"] == "confirm_fields"
     assert "search_tasks" not in db.calls
     assert db.inserts == 0
     assert db.updates == 0
@@ -287,7 +281,7 @@ def test_an_explicit_create_leaves_a_pending_update_conversation(
     body = response.json()
 
     assert body["intent"] == "CREATE_TASK"
-    assert body["stage"] == "fields"
+    assert body["stage"] == "confirm_fields"
     assert "search_tasks" not in db.calls
     assert db.updates == 0
     assert db.inserts == 0

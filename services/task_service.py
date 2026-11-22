@@ -52,6 +52,8 @@ from ai.query_session import (
     STAGE_UPDATE,
     TaskDraftEngine,
     TaskUpdateEngine,
+    reminder_is_declined,
+    required_task_fields,
 )
 from ai.text_extractor import TaskExtractor, sync_status_progress
 from database import read_planner
@@ -67,7 +69,6 @@ from database.sql_generator import (
     validate_updates,
 )
 from database.task_repository import (
-    create_task,
     get_all_tasks,
     get_task,
     run_sql_operation,
@@ -84,17 +85,41 @@ from services.conversation_memory import (
 from services.database_agent import run_database_agent
 from services.query_rewriter import rewrite_query_with_status
 from services.task_agent import ReadRequest, TaskAgent
+from services.task_scope import (
+    can_delete_task,
+    can_read_task,
+    can_update_task,
+    current_actor,
+    restricted_update_fields,
+)
 
 logger = logging.getLogger(__name__)
 
 extractor = TaskExtractor()
+
+
+def create_task(record):
+    """Create a confirmed draft through the central authorization service."""
+
+    from services import task_management
+
+    values = (
+        record.model_dump(exclude_none=True)
+        if hasattr(record, "model_dump")
+        else dict(record)
+    )
+    return task_management.create_task(values)
+
 
 TIMEZONE = getattr(config, "TIMEZONE", "Asia/Kolkata")
 
 TASK_PAYLOAD_FIELDS = (
     "id",
     "task_title",
+    "task_description",
     "assigned_to",
+    "created_by_employee_id",
+    "assigned_to_employee_id",
     "assigned_date",
     "assigned_time",
     "deadline_date",
@@ -187,6 +212,37 @@ def _field(task, name, default=None):
         return task.get(name, default)
 
     return getattr(task, name, default)
+
+
+def _legacy_owner_match(task, employee: str | None) -> bool:
+    if not employee:
+        return True
+
+    return (
+        (_field(task, "assigned_to") or "").strip().lower()
+        == employee.strip().lower()
+    )
+
+
+def _employee_can_read(task, employee: str | None) -> bool:
+    if current_actor() is not None:
+        return can_read_task(task)
+
+    return _legacy_owner_match(task, employee)
+
+
+def _employee_can_update(task, employee: str | None) -> bool:
+    if current_actor() is not None:
+        return can_update_task(task)
+
+    return _legacy_owner_match(task, employee)
+
+
+def _employee_can_delete(task, employee: str | None) -> bool:
+    if current_actor() is not None:
+        return can_delete_task(task)
+
+    return _legacy_owner_match(task, employee)
 
 
 def serialize_task(task) -> dict:
@@ -331,7 +387,7 @@ def _build_update_changes(changes):
         if time_value is not None:
             updates[f"{kind}_time"] = time_value
 
-    for name in ("task_title", "assigned_to"):
+    for name in ("task_title", "task_description", "assigned_to"):
         value = getattr(changes, name, None)
         if value and value.strip():
             updates[name] = value.strip()
@@ -448,7 +504,7 @@ def _find_update_task(find, task_id: int | None, owner: str | None) -> list:
         if task is None:
             return []
 
-        if owner and (_field(task, "assigned_to") or "").lower() != owner.strip().lower():
+        if not _employee_can_update(task, owner):
             return []
 
         return [task]
@@ -481,7 +537,7 @@ def _find_query_tasks(query, task_id: int | None, owner: str | None) -> list:
         if task is None:
             return []
 
-        if owner and (_field(task, "assigned_to") or "").lower() != owner.strip().lower():
+        if not _employee_can_read(task, owner):
             return []
 
         return [task]
@@ -896,7 +952,7 @@ def _read_task_field(task_id: int, field: str | None, *, employee=None) -> dict:
     if task is None:
         return {"status": "not_found", "task_id": task_id}
 
-    if employee and (_field(task, "assigned_to") or "").lower() != employee.strip().lower():
+    if not _employee_can_read(task, employee):
         return {"status": "not_found", "task_id": task_id}
 
     row = {
@@ -1067,7 +1123,7 @@ def _apply_update(
             "reply": "Task not found.",
         }
 
-    if employee and (_field(task, "assigned_to") or "").lower() != employee.strip().lower():
+    if not _employee_can_update(task, employee):
         return {
             "status": "error",
             "intent": UPDATE_TASK,
@@ -1077,6 +1133,17 @@ def _apply_update(
             "reply": (
                 "That task belongs to somebody else, so I did not change it."
             ),
+        }
+
+    disallowed = restricted_update_fields(updates)
+
+    if disallowed:
+        reply = "Employees cannot reassign a task."
+        return {
+            "status": "error",
+            "intent": UPDATE_TASK,
+            "message": reply,
+            "reply": reply,
         }
 
     try:
@@ -1134,8 +1201,28 @@ def _apply_update(
         }
 
     confirmation = _update_confirmation(user_input, validated, staged=staged)
+    actor = current_actor()
 
-    result = run_sql_operation(operation, confirmation=confirmation)
+    if actor is not None and confirmation != confirmation_phrase("UPDATE"):
+        # The validation still runs through the SQL layer, but the statement
+        # cannot execute without the exact confirmation phrase.
+        result = run_sql_operation(operation, confirmation=confirmation)
+    elif actor is not None:
+        from services import task_management
+
+        try:
+            task_management.update_task(_field(task, "id"), validated)
+        except task_management.TaskManagementError as error:
+            return {
+                "status": "error",
+                "intent": UPDATE_TASK,
+                "message": str(error),
+                "reply": str(error),
+            }
+
+        result = {"status": "success"}
+    else:
+        result = run_sql_operation(operation, confirmation=confirmation)
 
     if result.get("status") != "success":
         message = result.get("message") or "The update could not be applied."
@@ -1323,11 +1410,7 @@ def process_get(
 
     stored = get_task(result.get("task_id"))
 
-    if stored is None or (
-        employee
-        and (_field(stored, "assigned_to") or "").lower()
-        != employee.strip().lower()
-    ):
+    if stored is None or not _employee_can_read(stored, employee):
         reply = "I couldn't find a matching task."
         return {
             "status": "not_found",
@@ -1376,7 +1459,7 @@ def read_task(task_id: int, *, employee: str | None = None) -> dict:
             "tasks": [],
         }
 
-    if employee and (_field(task, "assigned_to") or "").lower() != employee.strip().lower():
+    if not _employee_can_read(task, employee):
         reply = "That task belongs to somebody else."
         return {
             "status": "not_found",
@@ -1537,6 +1620,34 @@ def process_list(
     )
 
     def run_query(title: str | None):
+        # Authenticated requests use the ORM scope, which understands the
+        # employee IDs on new rows as well as the legacy assigned_to name.
+        if current_actor() is not None:
+            try:
+                rows = search_tasks(
+                    task_title=title,
+                    assigned_to=assigned_to,
+                    owner=owner,
+                    status=filters.status,
+                )
+            except Exception as error:
+                logger.exception("The tasks could not be loaded: %s", error)
+                return None, "I couldn't load the tasks right now."
+
+            tasks = [serialize_task(row) for row in rows]
+
+            if statuses:
+                allowed = set(statuses)
+                tasks = [
+                    task for task in tasks
+                    if (task.get("status") or "PENDING").upper() in allowed
+                ]
+
+            if title:
+                tasks = task_search.rank(tasks, title, fields=("task_title",))
+
+            return tasks, None
+
         try:
             operation = build_select_operation(
                 status=None if statuses else filters.status,
@@ -1578,7 +1689,12 @@ def process_list(
     note = ""
     planner = "structured"
 
-    if not tasks and not assigned_to and _status_counts(owner):
+    if (
+        not tasks
+        and not assigned_to
+        and current_actor() is None
+        and _status_counts(owner)
+    ):
         agent_result = run_agentic_read(user_input, employee=owner)
 
         if agent_result is not None:
@@ -1710,7 +1826,7 @@ def process_delete(
             "reply": "Task not found.",
         }
 
-    if employee and (_field(task, "assigned_to") or "").lower() != employee.strip().lower():
+    if not _employee_can_delete(task, employee):
         return {
             "status": "error",
             "intent": DELETE_TASK,
@@ -1743,24 +1859,41 @@ def process_delete(
             "reply": reply,
         }
 
-    operation = build_delete_operation(
-        _field(task, "id"), intent=DELETE_TASK,
-        owner=_field(task, "assigned_to")
-    )
+    actor = current_actor()
 
-    try:
-        validate_operation(operation)
-    except OperationError as error:
-        return {
-            "status": "error",
-            "intent": DELETE_TASK,
-            "message": str(error),
-            "reply": str(error),
-        }
+    if actor is not None:
+        from services import task_management
 
-    result = run_sql_operation(
-        operation, confirmation=confirmation_phrase("DELETE")
-    )
+        try:
+            task_management.delete_task(_field(task, "id"))
+        except task_management.TaskManagementError as error:
+            return {
+                "status": "error",
+                "intent": DELETE_TASK,
+                "message": str(error),
+                "reply": str(error),
+            }
+
+        result = {"status": "success"}
+    else:
+        operation = build_delete_operation(
+            _field(task, "id"), intent=DELETE_TASK,
+            owner=_field(task, "assigned_to")
+        )
+
+        try:
+            validate_operation(operation)
+        except OperationError as error:
+            return {
+                "status": "error",
+                "intent": DELETE_TASK,
+                "message": str(error),
+                "reply": str(error),
+            }
+
+        result = run_sql_operation(
+            operation, confirmation=confirmation_phrase("DELETE")
+        )
 
     if result.get("status") != "success":
         message = result.get("message") or "The task could not be deleted."
@@ -1935,6 +2068,97 @@ def _clarification_of_result(result: dict) -> dict:
     }
 
 
+def _creation_of_result(result: dict) -> dict | None:
+    """The progressive-create state that must survive the next request.
+
+    ``None`` means this was not a CREATE turn. An empty dict means the task was
+    saved and any older creation state must be cleared.
+    """
+
+    result = result or {}
+
+    if result.get("intent") != CREATE_TASK:
+        return None
+
+    if result.get("status") == "success":
+        return {}
+
+    stage = result.get("stage")
+    draft = result.get("draft")
+
+    if stage not in CREATE_STAGES or not isinstance(draft, dict):
+        return None
+
+    missing = result.get("missing_fields")
+
+    if missing is None:
+        missing = [
+            name
+            for name in required_task_fields()
+            if draft.get(name) in (None, "")
+        ]
+
+    collected = {
+        name: value
+        for name, value in draft.items()
+        if name in FIELD_ORDER and value not in (None, "")
+    }
+
+    return {
+        "stage": stage,
+        "draft": dict(draft),
+        "missing_fields": list(missing),
+        "collected_fields": collected,
+        "last_question": (
+            result.get("question")
+            or result.get("reply")
+            or result.get("message")
+        ),
+    }
+
+
+def _pending_creation(memory: dict | None) -> dict | None:
+    context = (memory or {}).get("context") or {}
+    creation = context.get("task_creation") or {}
+
+    if not isinstance(creation, dict):
+        return None
+
+    if creation.get("stage") not in CREATE_STAGES:
+        return None
+
+    if not isinstance(creation.get("draft"), dict):
+        return None
+
+    return creation
+
+
+def _should_resume_creation(message: str, memory: dict | None) -> bool:
+    """Is a fresh message an answer to a pending create clarification?"""
+
+    creation = _pending_creation(memory)
+
+    if creation is None:
+        return False
+
+    text = (message or "").strip()
+
+    if not text:
+        return False
+
+    if is_explicit_create_request(text) or is_explicit_update_request(text):
+        return False
+
+    intent = detect_intent(text).name
+
+    # A short correction such as "change the title to ..." belongs to the
+    # draft. A different operation (read/list/delete) ends the clarification.
+    if intent in (CREATE_TASK, DELETE_TASK, LIST_TASKS, GET_TASK):
+        return False
+
+    return True
+
+
 def _looks_like_selection(
     message: str, candidates: list, action: str = "update"
 ) -> bool:
@@ -1985,6 +2209,14 @@ def _restore_conversation_state(
         return stage, draft
 
     context = (memory or {}).get("context") or {}
+    creation = _pending_creation(memory)
+
+    if creation is not None and _should_resume_creation(message, memory):
+        return (
+            creation.get("stage"),
+            dict(creation.get("draft") or {}),
+        )
+
     clarification = context.get("clarification") or {}
     saved_stage = clarification.get("stage")
     candidates = context.get("candidates") or []
@@ -2140,6 +2372,7 @@ def _remember_turn(
     pending = _pending_operation(result)
     candidates = _displayed_candidates(result)
     clarification = _clarification_of_result(result)
+    creation = _creation_of_result(result)
 
     agent_context = (result or {}).get("agent_context") or {}
     agent_candidates = agent_context.get("candidates") or []
@@ -2148,37 +2381,49 @@ def _remember_turn(
     if not candidates and agent_candidates:
         candidates = agent_candidates[:MAX_SELECTION_CANDIDATES]
 
-    if (result or {}).get("status") != "success":
-        context = {}
+    status = (result or {}).get("status")
 
-        # The change the employee asked for is kept until it is applied.
-        if pending:
-            context["pending"] = {
-                **pending,
-                "instruction": user_message,
+    if status != "success":
+        if status == "error":
+            # A failed operation never changes the active task or discards an
+            # older clarification.
+            context = {}
+
+            if pending:
+                context["pending"] = {
+                    **pending,
+                    "instruction": user_message,
+                }
+
+            if candidates:
+                context["candidates"] = candidates
+
+            if clarification:
+                context["clarification"] = clarification
+
+            if creation is not None:
+                context["task_creation"] = creation
+        else:
+            # A new/clarification turn replaces the previous conversation
+            # state. Explicit empty values are important here: otherwise a
+            # stale candidate list from an earlier selection survives.
+            context = {
+                "pending": (
+                    {**pending, "instruction": user_message}
+                    if pending
+                    else {}
+                ),
+                "candidates": (
+                    candidates[:MAX_SELECTION_CANDIDATES]
+                    if candidates
+                    else []
+                ),
+                "clarification": clarification or {},
+                "task_creation": creation if creation is not None else {},
             }
-
-        # The displayed candidates and the clarification survive a restart,
-        # so "the second one" can still be resolved later.
-        if candidates:
-            context["candidates"] = candidates
-
-        if clarification:
-            context["clarification"] = clarification
 
         if agent_trace:
             context["agent_trace"] = agent_trace[-8:]
-
-        if not context:
-            # The turn started something else, so an older clarification is
-            # not waiting any more. A failed operation never changes the
-            # active task.
-            context = {
-                "pending": {},
-                "candidates": [],
-                "clarification": {},
-                "agent_trace": [],
-            }
 
         try:
             save_conversation_memory(
@@ -2195,7 +2440,12 @@ def _remember_turn(
     task_id = _task_id_of(result)
 
     # A completed interaction closes the pending clarification.
-    cleared = {"pending": {}, "candidates": [], "clarification": {}}
+    cleared = {
+        "pending": {},
+        "candidates": [],
+        "clarification": {},
+        "task_creation": {},
+    }
 
     if candidates:
         cleared["candidates"] = candidates[:MAX_SELECTION_CANDIDATES]
@@ -2356,12 +2606,32 @@ def _display_value(name: str, value) -> str:
     return str(value)
 
 
-def _draft_summary(draft: dict) -> str:
-    lines = []
+def _collected_fields(draft: dict) -> dict:
+    """The values already collected, without internal draft bookkeeping."""
+
+    collected = {}
+
     for name in FIELD_ORDER:
-        label = FIELD_LABELS.get(name, name)
-        lines.append(f"• {label}: {_display_value(name, (draft or {}).get(name))}")
-    return "\n".join(lines)
+        value = (draft or {}).get(name)
+
+        if value is None or value == "":
+            continue
+
+        collected[name] = value
+
+    return collected
+
+
+def _draft_summary(draft: dict) -> str:
+    collected = _collected_fields(draft)
+
+    if not collected:
+        return "No fields collected yet."
+
+    return "\n".join(
+        f"• {FIELD_LABELS.get(name, name)}: {_display_value(name, value)}"
+        for name, value in collected.items()
+    )
 
 
 def _task_in_context(
@@ -2598,11 +2868,25 @@ def process_chat_turn(
     """
 
     transcript = (user_input or "").strip()
+    memory = _load_memory(user_id, employee, conversation_id)
+    resume_creation = stage in FRESH_STAGES and _should_resume_creation(
+        transcript, memory
+    )
+    creation_turn = (
+        stage in FRESH_STAGES and detect_intent(transcript).name == CREATE_TASK
+    )
 
     # A fresh turn can be understood by the LLM tool agent, which owns its
-    # own context resolution. Staged turns (answers to a running question)
-    # stay in the existing state machine.
-    if stage in FRESH_STAGES and _database_agent_enabled():
+    # own context resolution. A pending creation stays in the progressive
+    # create flow so the same task is completed instead of inserting a second
+    # row. Staged turns (answers to a running question) stay in the existing
+    # state machine.
+    if (
+        stage in FRESH_STAGES
+        and _database_agent_enabled()
+        and not resume_creation
+        and not creation_turn
+    ):
         agent_result = _run_database_agent_turn(
             transcript,
             employee=employee,
@@ -2622,7 +2906,7 @@ def process_chat_turn(
         draft=draft,
         # A turn of a running conversation answers a question of the
         # assistant, so it is never rewritten.
-        rewrite=stage in FRESH_STAGES,
+        rewrite=stage in FRESH_STAGES and not resume_creation,
         run=lambda instruction, restored_stage, restored_draft, restored_task_id: _run_chat_turn(
             instruction,
             task_id=task_id,
@@ -2744,7 +3028,9 @@ def _run_chat_turn(
             )
 
         elif stage == STAGE_CONFIRM_REMINDER:
-            if confirm or _is_affirmation(transcript):
+            if reminder_is_declined(transcript):
+                result = engine.skip_reminder(draft)
+            elif confirm or _is_affirmation(transcript):
                 result = engine.confirm_reminder(draft, True)
             elif _is_negative(transcript):
                 result = engine.confirm_reminder(draft, False)
@@ -2791,7 +3077,9 @@ def process_voice_turn(
     transcript = (user_input or "").strip()
 
     if stage in (None, "", "start"):
-        if _database_agent_enabled():
+        creation_turn = detect_intent(transcript).name == CREATE_TASK
+
+        if _database_agent_enabled() and not creation_turn:
             agent_result = _run_database_agent_turn(
                 transcript,
                 employee=employee,
@@ -2844,10 +3132,17 @@ def _run_create_flow(
     confirm: bool,
 ):
     engine = TaskDraftEngine(extractor)
+    actor = current_actor()
+    self_service = bool(
+        actor is not None and not actor.has_permission("tasks.update_all")
+    )
 
     try:
         if stage in (None, "", "start"):
-            result = engine.start(user_input)
+            result = engine.start(
+                user_input,
+                default_assignee=actor.name if self_service else None,
+            )
         elif stage == "fields":
             # The conversational stage: the reply fills the missing field.
             if answers:
@@ -2864,7 +3159,9 @@ def _run_create_flow(
         elif stage == "reminder":
             result = engine.set_reminder(draft or {}, reminder_text or user_input)
         elif stage == "confirm_reminder":
-            if reminder_text:
+            if reminder_is_declined(user_input):
+                result = engine.skip_reminder(draft or {})
+            elif reminder_text:
                 result = engine.set_reminder(draft or {}, reminder_text)
             else:
                 result = engine.confirm_reminder(draft or {}, bool(confirm))
@@ -2875,12 +3172,49 @@ def _run_create_flow(
         # Cohere/API failures surface as a normal error result.
         return {"status": "error", "message": str(error)}
 
+    if self_service:
+        assigned_to = str(result.draft.get("assigned_to") or "").strip()
+
+        if assigned_to and assigned_to.casefold() != actor.name.casefold():
+            from services.task_management import SELF_ONLY_ASSIGNMENT_MESSAGE
+
+            return {
+                "status": "error",
+                "intent": CREATE_TASK,
+                "message": SELF_ONLY_ASSIGNMENT_MESSAGE,
+                "reply": SELF_ONLY_ASSIGNMENT_MESSAGE,
+            }
+
+        # Even if extraction did not mention an assignee, the draft is
+        # completed for the authenticated employee, never for somebody else.
+        result.draft["assigned_to"] = actor.name
+
     return _engine_result_to_response(result)
 
 
 def _engine_result_to_response(result):
     if result.done:
-        saved_task = create_task(result.record)
+        actor = current_actor()
+
+        if actor is not None and not actor.has_permission("tasks.create"):
+            return {
+                "status": "error",
+                "intent": CREATE_TASK,
+                "message": "You do not have permission to create tasks.",
+                "reply": "You do not have permission to create tasks.",
+            }
+
+        from services import task_management
+
+        try:
+            saved_task = create_task(result.record)
+        except task_management.TaskManagementError as error:
+            return {
+                "status": "error",
+                "intent": CREATE_TASK,
+                "message": str(error),
+                "reply": str(error),
+            }
 
         return {
             "status": "success",
@@ -2894,6 +3228,8 @@ def _engine_result_to_response(result):
         "stage": result.stage,
         "draft": result.draft,
         "intent": CREATE_TASK,
+        "required_fields": list(required_task_fields()),
+        "collected_fields": _collected_fields(result.draft),
     }
 
     if result.stage == STAGE_FIELDS:
@@ -2906,6 +3242,7 @@ def _engine_result_to_response(result):
 
     elif result.stage == STAGE_CONFIRM_FIELDS:
         response["status"] = "confirmation_required"
+        response["missing_fields"] = []
         response["message"] = result.message
         response["reply"] = (
             "Here is what I have so far:\n"

@@ -1,19 +1,3 @@
-<<<<<<< Updated upstream
-# Python
-__pycache__/
-*.py[cod]
-
-# Test / tooling caches
-.pytest_cache/
-
-# Environment / secrets
-.env
-
-# Virtual environments
-.venv/
-venv/
-=======
-
 # Environment variables and secrets
 .env
 .env.*
@@ -62,4 +46,9 @@ Thumbs.db
 # Local database files
 *.db
 *.sqlite3
->>>>>>> Stashed changes
+
+# MCP tunnel secrets and local binaries (never commit credentials/tokens)
+/tunnel/secrets/
+/tunnel/bin/
+/root/.config/tunnel-client/fnw-mcp-credential
+/root/.config/tunnel-client/fnw-mcp-authorization

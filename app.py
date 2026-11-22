@@ -2,8 +2,14 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import date, time
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import (
+    Depends,
     FastAPI,
     UploadFile,
     File,
@@ -14,7 +20,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from database.connection import create_tables
 from database.task_repository import get_all_tasks
@@ -32,6 +38,28 @@ from services.task_service import (
     serialize_task,
 )
 
+from services.conversation_memory import update_response_feedback
+from services.task_scope import TaskActor, use_task_actor
+from ai.mcp_client.context import use_mcp_access_token
+from mcp_server.configuration import clear_mcp_settings_cache, load_mcp_settings
+
+import auth.config as auth_config
+from auth.dependencies import require_any_permission, require_permission
+from auth.permissions import (
+    TASKS_CREATE,
+    TASKS_DELETE,
+    TASKS_READ,
+    TASKS_UPDATE,
+    TASK_TURN_PERMISSIONS,
+)
+from auth.routes import router as auth_router
+from auth.employee_routes import router as employees_router
+from auth.mcp_credential_routes import router as mcp_credentials_router
+from notification_routes import router as notifications_router
+from auth.service import AuthenticatedEmployee
+from database.sql_execution import confirmation_phrase, validate_confirmation
+from services import task_management
+
 
 # Logging configuration
 logging.basicConfig(
@@ -48,11 +76,30 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing application...")
 
+    config_errors = auth_config.settings.secure_config_errors
+
+    if config_errors:
+        raise RuntimeError(" ".join(config_errors))
+
     create_tables()
 
     logger.info("Database initialized successfully.")
 
-    yield
+    mcp_settings = load_mcp_settings()
+
+    if mcp_settings.enabled:
+        # Reconcile after migrations/schema setup and before MCP requests are served.
+        from auth.mcp_credentials import reconcile_bootstrap_mcp_credential
+
+        reconcile_bootstrap_mcp_credential()
+
+        from mcp_server.server import mcp_lifespan
+
+        async with mcp_lifespan():
+            logger.info("MCP server started at %s.", mcp_settings.path)
+            yield
+    else:
+        yield
 
     logger.info("Application shutting down.")
 
@@ -63,6 +110,20 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+app.include_router(auth_router)
+app.include_router(mcp_credentials_router)
+app.include_router(employees_router)
+app.include_router(notifications_router)
+
+
+clear_mcp_settings_cache()
+_mcp_settings = load_mcp_settings()
+
+if _mcp_settings.enabled:
+    from mcp_server.server import mount_mcp
+
+    mount_mcp(app)
 
 
 # CORS configuration. Comma-separated origins can be provided through
@@ -78,7 +139,27 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS or ["http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
+
+
+@app.middleware("http")
+async def mcp_access_token_context(request, call_next):
+    """Keep a caller MCP credential available to the MCP-backed adapter.
+
+    Only dedicated ``fnw_mcp_...`` credentials are propagated. The /mcp
+    endpoint rejects employee JWTs, so REST/JWT requests keep the direct agent
+    path and their existing authentication remains unchanged.
+    """
+
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    token = token.strip()
+
+    if scheme.strip().lower() == "bearer" and token.startswith("fnw_mcp_"):
+        with use_mcp_access_token(token):
+            return await call_next(request)
+
+    return await call_next(request)
 
 
 # Request schema
@@ -99,6 +180,14 @@ class TaskRequest(BaseModel):
     employee: str | None = None
 
 
+class FeedbackRequest(BaseModel):
+    """A thumbs up (``True``) or thumbs down (``False``) rating."""
+
+    conversation_id: str
+    user_id: str
+    feedback: bool
+
+
 class ChatRequest(BaseModel):
     """One turn of the live, two-way task conversation."""
 
@@ -116,6 +205,105 @@ class ChatRequest(BaseModel):
     user_id: str | None = None
 
 
+class TaskCreateRequest(BaseModel):
+    """Fields accepted when creating a task.
+
+    Employees may only create tasks for themselves; the service replaces any
+    supplied assignee with the authenticated employee.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_title: str
+    task_description: str | None = None
+    assigned_to: str | None = None
+    assigned_to_employee_id: int | None = None
+    assigned_date: date | None = None
+    assigned_time: time | None = None
+    deadline_date: date | None = None
+    deadline_time: time | None = None
+    reminder_date: date | None = None
+    reminder_time: time | None = None
+    status: str | None = None
+    progress: int = Field(default=0, strict=True, ge=0, le=100)
+
+
+class TaskEditRequest(BaseModel):
+    """Full task fields for the owner, an administrator or a manager."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_title: str | None = None
+    task_description: str | None = None
+    assigned_to: str | None = None
+    assigned_to_employee_id: int | None = None
+    assigned_date: date | None = None
+    assigned_time: time | None = None
+    deadline_date: date | None = None
+    deadline_time: time | None = None
+    reminder_date: date | None = None
+    reminder_time: time | None = None
+    status: str | None = None
+    progress: int | None = Field(default=None, strict=True, ge=0, le=100)
+
+
+class TaskProgressRequest(BaseModel):
+    """The progress-only task write."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    progress: int = Field(strict=True, ge=0, le=100)
+
+
+class TaskDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str | None = None
+
+
+# RESPONSE FEEDBACK ENDPOINT
+@app.post("/feedback")
+@app.post("/tasks/feedback")
+def handle_feedback(
+    request: FeedbackRequest,
+    employee: AuthenticatedEmployee | None = Depends(require_permission(TASKS_READ)),
+):
+
+    try:
+
+        logger.info("Received response feedback.")
+
+        with use_task_actor(_task_actor(employee)):
+            memory = update_response_feedback(
+                _memory_user_id(employee, request.user_id),
+                request.conversation_id,
+                request.feedback,
+            )
+
+        if memory is None:
+            raise HTTPException(
+                status_code=400,
+                detail="A user id and conversation id are required."
+            )
+
+        return {
+            "status": "success",
+            "response_feedback": memory["response_feedback"],
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+
+        logger.exception("Response feedback could not be stored.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to store feedback."
+        )
+
+
 # Health check
 @app.get("/health")
 def health_check():
@@ -130,15 +318,37 @@ def _serialize_task(task) -> dict:
     return serialize_task(task)
 
 
+def _task_actor(employee: AuthenticatedEmployee | None) -> TaskActor | None:
+    return TaskActor.from_employee(employee) if employee is not None else None
+
+
+def _employee_name(
+    employee: AuthenticatedEmployee | None,
+    fallback: str | None = None,
+) -> str | None:
+    return employee.name if employee is not None else fallback
+
+
+def _memory_user_id(
+    employee: AuthenticatedEmployee | None,
+    fallback: str | None = None,
+) -> str | None:
+    # An id, not a name or a client-generated value, owns conversation memory.
+    return f"employee:{employee.id}" if employee is not None else fallback
+
+
 # LIST TASKS ENDPOINT
 @app.get("/tasks")
-def list_tasks():
+def list_tasks(
+    employee: AuthenticatedEmployee | None = Depends(require_permission(TASKS_READ)),
+):
 
     try:
 
-        logger.info("Fetching all tasks.")
+        logger.info("Fetching tasks for the signed-in employee.")
 
-        tasks = get_all_tasks()
+        with use_task_actor(_task_actor(employee)):
+            tasks = get_all_tasks()
 
         return {
             "count": len(tasks),
@@ -155,15 +365,173 @@ def list_tasks():
         )
 
 
+def _task_management_error(error: task_management.TaskManagementError) -> HTTPException:
+    return HTTPException(
+        status_code=error.status_code,
+        detail=str(error),
+    )
+
+
+# CREATE TASK ENDPOINT
+@app.post("/tasks", status_code=201)
+def create_task_endpoint(
+    request: TaskCreateRequest,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_permission(TASKS_CREATE)
+    ),
+):
+
+    try:
+
+        with use_task_actor(_task_actor(employee)):
+            task = task_management.create_task(
+                request.model_dump(exclude_none=True)
+            )
+
+        return {
+            "status": "success",
+            "task": _serialize_task(task),
+        }
+
+    except task_management.TaskManagementError as error:
+        raise _task_management_error(error)
+
+    except Exception:
+
+        logger.exception("Failed to create a task.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create the task."
+        )
+
+
+# FULL TASK EDIT ENDPOINT (OWN TASK OR ADMIN / MANAGER)
+@app.patch("/tasks/{task_id}")
+def update_task_endpoint(
+    task_id: int,
+    request: TaskEditRequest,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_permission(TASKS_UPDATE)
+    ),
+):
+
+    values = request.model_dump(exclude_unset=True)
+
+    try:
+
+        with use_task_actor(_task_actor(employee)):
+            task = task_management.update_task(task_id, values)
+
+        return {
+            "status": "success",
+            "task": _serialize_task(task),
+        }
+
+    except task_management.TaskManagementError as error:
+        raise _task_management_error(error)
+
+    except Exception:
+
+        logger.exception("Failed to update task %s.", task_id)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to update the task."
+        )
+
+
+# EMPLOYEE PROGRESS ENDPOINT
+@app.patch("/tasks/{task_id}/progress")
+def update_task_progress_endpoint(
+    task_id: int,
+    request: TaskProgressRequest,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_permission(TASKS_UPDATE)
+    ),
+):
+
+    try:
+
+        with use_task_actor(_task_actor(employee)):
+            task = task_management.update_progress(task_id, request.progress)
+
+        return {
+            "status": "success",
+            "task": _serialize_task(task),
+        }
+
+    except task_management.TaskManagementError as error:
+        raise _task_management_error(error)
+
+    except Exception:
+
+        logger.exception("Failed to update progress for task %s.", task_id)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to update the task progress."
+        )
+
+
+# DELETE TASK ENDPOINT (OWN TASK OR ADMIN / MANAGER)
+@app.delete("/tasks/{task_id}")
+def delete_task_endpoint(
+    task_id: int,
+    request: TaskDeleteRequest,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_permission(TASKS_DELETE)
+    ),
+):
+
+    if not validate_confirmation("DELETE", request.confirmation):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Deleting a task requires this confirmation: "
+                f"{confirmation_phrase('DELETE')}"
+            ),
+        )
+
+    try:
+
+        with use_task_actor(_task_actor(employee)):
+            deleted_id = task_management.delete_task(task_id)
+
+        return {
+            "status": "success",
+            "deleted_task_id": deleted_id,
+        }
+
+    except task_management.TaskManagementError as error:
+        raise _task_management_error(error)
+
+    except Exception:
+
+        logger.exception("Failed to delete task %s.", task_id)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to delete the task."
+        )
+
+
 # READ ONE TASK ENDPOINT
 @app.get("/tasks/{task_id}")
-def read_task_by_id(task_id: int):
+def read_task_by_id(
+    task_id: int,
+    employee: AuthenticatedEmployee | None = Depends(require_permission(TASKS_READ)),
+):
 
     try:
 
         logger.info("Fetching task %s.", task_id)
 
-        result = read_task(task_id)
+        with use_task_actor(_task_actor(employee)):
+            result = read_task(
+                task_id,
+                employee=_employee_name(employee),
+            )
 
         # A task that does not exist is answered with the same shape as a
         # task that does, so a client never hits a KeyError on "task".
@@ -193,23 +561,29 @@ def read_task_by_id(task_id: int):
 
 # TEXT INPUT ENDPOINT
 @app.post("/tasks/text")
-def handle_text(request: TaskRequest):
+def handle_text(
+    request: TaskRequest,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_any_permission(*TASK_TURN_PERMISSIONS)
+    ),
+):
 
     try:
 
         logger.info("Received text task request.")
 
-        result = process_task(
-            user_input=request.text,
-            task_id=request.task_id,
-            confirm_delete=request.confirm_delete,
-            stage=request.stage,
-            draft=request.draft,
-            answers=request.answers,
-            reminder_text=request.reminder_text,
-            confirm=request.confirm,
-            employee=request.employee,
-        )
+        with use_task_actor(_task_actor(employee)):
+            result = process_task(
+                user_input=request.text,
+                task_id=request.task_id,
+                confirm_delete=request.confirm_delete,
+                stage=request.stage,
+                draft=request.draft,
+                answers=request.answers,
+                reminder_text=request.reminder_text,
+                confirm=request.confirm,
+                employee=_employee_name(employee, request.employee),
+            )
 
         logger.info("Text task processing completed.")
 
@@ -236,24 +610,30 @@ def handle_text(request: TaskRequest):
 
 # CONVERSATIONAL CHAT ENDPOINT
 @app.post("/tasks/chat")
-def handle_chat(request: ChatRequest):
+def handle_chat(
+    request: ChatRequest,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_any_permission(*TASK_TURN_PERMISSIONS)
+    ),
+):
 
     try:
 
         logger.info("Received chat conversation turn.")
 
-        result = process_chat_turn(
-            user_input=request.message,
-            stage=request.stage,
-            draft=request.draft,
-            answers=request.answers,
-            reminder_text=request.reminder_text,
-            confirm=request.confirm,
-            confirm_delete=request.confirm_delete,
-            employee=request.employee,
-            conversation_id=request.conversation_id,
-            user_id=request.user_id,
-        )
+        with use_task_actor(_task_actor(employee)):
+            result = process_chat_turn(
+                user_input=request.message,
+                stage=request.stage,
+                draft=request.draft,
+                answers=request.answers,
+                reminder_text=request.reminder_text,
+                confirm=request.confirm,
+                confirm_delete=request.confirm_delete,
+                employee=_employee_name(employee, request.employee),
+                conversation_id=request.conversation_id,
+                user_id=_memory_user_id(employee, request.user_id),
+            )
 
         logger.info("Chat conversation turn processed.")
 
@@ -330,6 +710,9 @@ def handle_voice(
     employee: str | None = Form(None),
     conversation_id: str | None = Form(None),
     user_id: str | None = Form(None),
+    authenticated_employee: AuthenticatedEmployee | None = Depends(
+        require_any_permission(*TASK_TURN_PERMISSIONS)
+    ),
 ):
 
     try:
@@ -368,19 +751,28 @@ def handle_voice(
 
         voice_state = _parse_voice_state(state)
 
-        result = process_voice_turn(
-            transcription.text,
-            task_id=task_id,
-            confirm_delete=confirm_delete,
-            stage=stage or voice_state.get("stage"),
-            draft=voice_state.get("draft"),
-            answers=voice_state.get("answers"),
-            reminder_text=reminder_text or voice_state.get("reminder_text"),
-            confirm=confirm or bool(voice_state.get("confirm")),
-            employee=employee or voice_state.get("employee"),
-            conversation_id=conversation_id or voice_state.get("conversation_id"),
-            user_id=user_id or voice_state.get("user_id"),
-        )
+        with use_task_actor(_task_actor(authenticated_employee)):
+            result = process_voice_turn(
+                transcription.text,
+                task_id=task_id,
+                confirm_delete=confirm_delete,
+                stage=stage or voice_state.get("stage"),
+                draft=voice_state.get("draft"),
+                answers=voice_state.get("answers"),
+                reminder_text=reminder_text or voice_state.get("reminder_text"),
+                confirm=confirm or bool(voice_state.get("confirm")),
+                employee=_employee_name(
+                    authenticated_employee,
+                    employee or voice_state.get("employee"),
+                ),
+                conversation_id=(
+                    conversation_id or voice_state.get("conversation_id")
+                ),
+                user_id=_memory_user_id(
+                    authenticated_employee,
+                    user_id or voice_state.get("user_id"),
+                ),
+            )
 
         logger.info("Voice task processing completed.")
 
