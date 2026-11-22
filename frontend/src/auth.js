@@ -10,6 +10,9 @@ export const AUTH_LOGIN_API = `${API}/auth/google/login`;
 export const AUTH_LOGOUT_API = `${API}/auth/logout`;
 export const AUTH_LOGOUT_ALL_API = `${API}/auth/logout-all`;
 
+const CSRF_COOKIE_NAME = "taskflow_csrf";
+let csrfToken = "";
+
 export function readCookie(name) {
   if (typeof document === "undefined") return "";
 
@@ -22,8 +25,22 @@ export function readCookie(name) {
   return match ? decodeURIComponent(match.slice(prefix.length)) : "";
 }
 
+export function setCsrfToken(token) {
+  if (typeof token === "string" && token) {
+    csrfToken = token;
+  }
+}
+
+export function clearCsrfToken() {
+  csrfToken = "";
+}
+
+function currentCsrfToken() {
+  return csrfToken || readCookie(CSRF_COOKIE_NAME);
+}
+
 const csrfHeaders = () => {
-  const token = readCookie("taskflow_csrf");
+  const token = currentCsrfToken();
   return token ? { "X-CSRF-Token": token } : {};
 };
 
@@ -42,6 +59,10 @@ async function postRefreshRequest() {
     headers: csrfHeaders(),
   });
   const data = await response.json().catch(() => ({}));
+
+  if (response.ok && data?.csrf_token) {
+    setCsrfToken(data.csrf_token);
+  }
 
   return {
     ok: response.ok,
@@ -71,6 +92,7 @@ export async function logoutRequest(accessToken, allSessions = false) {
       ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     },
   }).catch(() => {});
+  clearCsrfToken();
 }
 
 export function authErrorMessage(code) {

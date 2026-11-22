@@ -354,6 +354,7 @@ def refresh(request: Request):
                 "token_type": "bearer",
                 "expires_in": settings.access_token_minutes * 60,
                 "expires_at": f"{expires_at.isoformat()}Z",
+                "csrf_token": csrf_token,
                 "employee": employee.to_payload(),
             }
         )
@@ -394,6 +395,7 @@ def refresh(request: Request):
                     session_id=employee.session_id or str(replacement_session_id),
                     settings=settings,
                 )
+                csrf_token = request.cookies.get(settings.csrf_cookie_name) or ""
 
                 return JSONResponse(
                     {
@@ -401,6 +403,7 @@ def refresh(request: Request):
                         "token_type": "bearer",
                         "expires_in": settings.access_token_minutes * 60,
                         "expires_at": f"{expires_at.isoformat()}Z",
+                        "csrf_token": csrf_token,
                         "employee": employee.to_payload(),
                     }
                 )

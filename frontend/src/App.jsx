@@ -4,6 +4,7 @@ import {
   API_BASE as API,
   authErrorMessage,
   beginGoogleLogin,
+  clearCsrfToken,
   logoutRequest,
   refreshSessionRequest,
 } from "./auth";
@@ -430,6 +431,7 @@ function App() {
     const promise = (async () => {
       const applySignedOut = (message = "") => {
         accessTokenRef.current = null;
+        clearCsrfToken();
         setAuth({
           status: "signed_out",
           accessToken: null,

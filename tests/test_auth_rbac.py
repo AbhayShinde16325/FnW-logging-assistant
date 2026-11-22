@@ -644,6 +644,75 @@ def test_google_callback_valid_flow_sets_session_and_redirects(auth_client, monk
     assert any("Max-Age=0" in h or "expires=" in h.lower() for h in state_cookies)
 
 
+def test_google_callback_to_refresh_works_with_csrf_header_flow(auth_client, monkeypatch):
+    """Production-style flow: callback sets cookies, frontend reads CSRF cookie and sends header on refresh."""
+    client, settings = auth_client
+    state, _ = _start_google_login(client, settings, return_to="/tasks")
+
+    monkeypatch.setattr(
+        auth_routes,
+        "exchange_code",
+        lambda **kwargs: {"id_token": "google-id-token"},
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "verify_id_token",
+        lambda **kwargs: {
+            "sub": "sub-1",
+            "email": "rahul@example.com",
+            "name": "Rahul",
+        },
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "find_or_link_google_employee",
+        lambda **kwargs: SimpleNamespace(id=7, email="rahul@example.com"),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "create_session",
+        lambda *args, **kwargs: ("refresh-token", SimpleNamespace(id="session-1", employee_id=7)),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "rotate_refresh_session",
+        lambda *args, **kwargs: ("refresh-token-2", SimpleNamespace(id="session-1", employee_id=7)),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "employee_for_session",
+        lambda *args, **kwargs: employee([TASKS_READ], employee_id=7, name="Rahul"),
+    )
+
+    callback = client.get(
+        f"/auth/google/callback?code=test-code&state={state}",
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+
+    csrf_token = client.cookies.get(settings.csrf_cookie_name)
+    assert csrf_token
+    # Simulate frontend reading cookie and sending X-CSRF-Token header
+    refresh = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf_token})
+    assert refresh.status_code == 200, refresh.text
+    data = refresh.json()
+    assert data["access_token"]
+    assert data["employee"]["email"] == "employee-7@example.com"
+    assert data["csrf_token"]
+    assert client.cookies.get(settings.refresh_cookie_name) == "refresh-token-2"
+
+
+def test_refresh_rejects_mismatched_csrf_header(auth_client):
+    client, settings = auth_client
+    client.cookies.set(settings.refresh_cookie_name, "refresh-token")
+    client.cookies.set(settings.csrf_cookie_name, "csrf-cookie")
+
+    response = client.post("/auth/refresh", headers={"X-CSRF-Token": "wrong"})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "The request could not be verified."
+
+
 # --- database agent write authorization ------------------------------------
 
 
