@@ -26,12 +26,25 @@ except Exception:
 from auth.routes import router as auth_router
 
 
-EXPECTED_CLIENT_ID = "825377307933-vfs64f1ll039t8pospvunq6ha3q7d0tf.apps.googleusercontent.com"
-EXPECTED_REDIRECT_URI = "http://localhost:8010/auth/google/callback"
-EXPECTED_FRONTEND_ORIGINS = {"http://localhost:8088", "http://localhost:5173"}
-EXPECTED_POST_LOGIN = "http://localhost:8088"
-EXPECTED_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
-EXPECTED_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+def _csv_env(name: str) -> set[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return set()
+    return {item.strip().rstrip("/") for item in raw.split(",") if item.strip()}
+
+
+EXPECTED_CLIENT_ID = os.getenv("EXPECTED_GOOGLE_CLIENT_ID", "").strip()
+EXPECTED_REDIRECT_URI = os.getenv("EXPECTED_GOOGLE_REDIRECT_URI", "").strip()
+EXPECTED_FRONTEND_ORIGINS = _csv_env("EXPECTED_FRONTEND_URLS")
+EXPECTED_POST_LOGIN = os.getenv("EXPECTED_AUTH_POST_LOGIN_REDIRECT", "").strip().rstrip("/")
+EXPECTED_AUTH_ENDPOINT = os.getenv(
+    "EXPECTED_GOOGLE_AUTHORIZATION_ENDPOINT",
+    "https://accounts.google.com/o/oauth2/v2/auth",
+).strip()
+EXPECTED_TOKEN_ENDPOINT = os.getenv(
+    "EXPECTED_GOOGLE_TOKEN_ENDPOINT",
+    "https://oauth2.googleapis.com/token",
+).strip()
 
 
 def ok(label, value, good=True):
@@ -61,27 +74,119 @@ def main() -> int:
     failures = 0
 
     failures += ok("GOOGLE_CLIENT_ID present", bool(s.google_client_id), bool(s.google_client_id))
-    failures += ok("GOOGLE_CLIENT_ID matches expected", s.google_client_id == EXPECTED_CLIENT_ID, s.google_client_id == EXPECTED_CLIENT_ID)
+    if EXPECTED_CLIENT_ID:
+        failures += ok(
+            "GOOGLE_CLIENT_ID matches expected",
+            s.google_client_id == EXPECTED_CLIENT_ID,
+            s.google_client_id == EXPECTED_CLIENT_ID,
+        )
+    else:
+        print("[INFO] EXPECTED_GOOGLE_CLIENT_ID not set; skipping exact client ID match.")
+
     failures += ok("GOOGLE_CLIENT_SECRET present", bool(s.google_client_secret), bool(s.google_client_secret))
     failures += ok("GOOGLE_REDIRECT_URI valid", valid_abs_url(s.google_redirect_uri), valid_abs_url(s.google_redirect_uri))
-    failures += ok("GOOGLE_REDIRECT_URI matches expected", s.google_redirect_uri == EXPECTED_REDIRECT_URI, s.google_redirect_uri == EXPECTED_REDIRECT_URI)
-    failures += ok("FRONTEND_URL origins valid", all(valid_abs_url(o) for o in s.frontend_origins), all(valid_abs_url(o) for o in s.frontend_origins))
-    failures += ok("FRONTEND_URL contains expected origins", set(s.frontend_origins) == EXPECTED_FRONTEND_ORIGINS, set(s.frontend_origins) == EXPECTED_FRONTEND_ORIGINS)
+    if EXPECTED_REDIRECT_URI:
+        failures += ok(
+            "GOOGLE_REDIRECT_URI matches expected",
+            s.google_redirect_uri == EXPECTED_REDIRECT_URI,
+            s.google_redirect_uri == EXPECTED_REDIRECT_URI,
+        )
+    else:
+        print("[INFO] EXPECTED_GOOGLE_REDIRECT_URI not set; skipping exact redirect match.")
+
+    failures += ok(
+        "FRONTEND_URL origins valid",
+        all(valid_abs_url(o) for o in s.frontend_origins),
+        all(valid_abs_url(o) for o in s.frontend_origins),
+    )
+    if EXPECTED_FRONTEND_ORIGINS:
+        failures += ok(
+            "FRONTEND_URL contains expected origins",
+            set(s.frontend_origins) == EXPECTED_FRONTEND_ORIGINS,
+            set(s.frontend_origins) == EXPECTED_FRONTEND_ORIGINS,
+        )
+    else:
+        print("[INFO] EXPECTED_FRONTEND_URLS not set; skipping exact frontend origin match.")
+
     failures += ok("AUTH_POST_LOGIN_REDIRECT valid", valid_abs_url(s.post_login_redirect), valid_abs_url(s.post_login_redirect))
-    failures += ok("AUTH_POST_LOGIN_REDIRECT allowed", s.post_login_redirect.rstrip('/') in {o.rstrip('/') for o in s.frontend_origins}, s.post_login_redirect.rstrip('/') in {o.rstrip('/') for o in s.frontend_origins})
-    failures += ok("AUTH_POST_LOGIN_REDIRECT matches expected", s.post_login_redirect == EXPECTED_POST_LOGIN, s.post_login_redirect == EXPECTED_POST_LOGIN)
-    failures += ok("GOOGLE_AUTHORIZATION_ENDPOINT valid", valid_abs_url(s.google_authorization_endpoint), valid_abs_url(s.google_authorization_endpoint))
-    failures += ok("GOOGLE_AUTHORIZATION_ENDPOINT matches expected", s.google_authorization_endpoint == EXPECTED_AUTH_ENDPOINT, s.google_authorization_endpoint == EXPECTED_AUTH_ENDPOINT)
-    failures += ok("GOOGLE_TOKEN_ENDPOINT valid", valid_abs_url(s.google_token_endpoint), valid_abs_url(s.google_token_endpoint))
-    failures += ok("GOOGLE_TOKEN_ENDPOINT matches expected", s.google_token_endpoint == EXPECTED_TOKEN_ENDPOINT, s.google_token_endpoint == EXPECTED_TOKEN_ENDPOINT)
-    failures += ok("Callback route /auth/google/callback registered", route_exists("/auth/google/callback", "GET"), route_exists("/auth/google/callback", "GET"))
-    failures += ok("Login route /auth/google/login registered", route_exists("/auth/google/login", "GET"), route_exists("/auth/google/login", "GET"))
+    failures += ok(
+        "AUTH_POST_LOGIN_REDIRECT allowed",
+        s.post_login_redirect.rstrip("/") in {o.rstrip("/") for o in s.frontend_origins},
+        s.post_login_redirect.rstrip("/") in {o.rstrip("/") for o in s.frontend_origins},
+    )
+    if EXPECTED_POST_LOGIN:
+        failures += ok(
+            "AUTH_POST_LOGIN_REDIRECT matches expected",
+            s.post_login_redirect == EXPECTED_POST_LOGIN,
+            s.post_login_redirect == EXPECTED_POST_LOGIN,
+        )
+    else:
+        print("[INFO] EXPECTED_AUTH_POST_LOGIN_REDIRECT not set; skipping exact post-login match.")
+
+    failures += ok(
+        "GOOGLE_AUTHORIZATION_ENDPOINT valid",
+        valid_abs_url(s.google_authorization_endpoint),
+        valid_abs_url(s.google_authorization_endpoint),
+    )
+    failures += ok(
+        "GOOGLE_AUTHORIZATION_ENDPOINT matches expected",
+        s.google_authorization_endpoint == EXPECTED_AUTH_ENDPOINT,
+        s.google_authorization_endpoint == EXPECTED_AUTH_ENDPOINT,
+    )
+    failures += ok(
+        "GOOGLE_TOKEN_ENDPOINT valid",
+        valid_abs_url(s.google_token_endpoint),
+        valid_abs_url(s.google_token_endpoint),
+    )
+    failures += ok(
+        "GOOGLE_TOKEN_ENDPOINT matches expected",
+        s.google_token_endpoint == EXPECTED_TOKEN_ENDPOINT,
+        s.google_token_endpoint == EXPECTED_TOKEN_ENDPOINT,
+    )
+
+    failures += ok(
+        "AUTH_COOKIE_SECURE is set",
+        isinstance(s.cookie_secure, bool),
+        isinstance(s.cookie_secure, bool),
+    )
+    failures += ok(
+        "AUTH_COOKIE_SAME_SITE is lax/strict/none",
+        s.cookie_same_site in {"lax", "strict", "none"},
+        s.cookie_same_site in {"lax", "strict", "none"},
+    )
+    if s.cookie_same_site == "none":
+        failures += ok(
+            "AUTH_COOKIE_SAME_SITE=none requires AUTH_COOKIE_SECURE=true",
+            bool(s.cookie_secure),
+            bool(s.cookie_secure),
+        )
+
+    failures += ok(
+        "Callback route /auth/google/callback registered",
+        route_exists("/auth/google/callback", "GET"),
+        route_exists("/auth/google/callback", "GET"),
+    )
+    failures += ok(
+        "Login route /auth/google/login registered",
+        route_exists("/auth/google/login", "GET"),
+        route_exists("/auth/google/login", "GET"),
+    )
 
     docker_redirect = os.getenv("DOCKER_GOOGLE_REDIRECT_URI")
     docker_frontend = os.getenv("DOCKER_FRONTEND_URL")
     if docker_redirect or docker_frontend:
-        failures += ok("DOCKER_GOOGLE_REDIRECT_URI matches", docker_redirect == EXPECTED_REDIRECT_URI, docker_redirect == EXPECTED_REDIRECT_URI)
-        failures += ok("DOCKER_FRONTEND_URL contains expected", set(filter(None, (docker_frontend or '').split(','))) == EXPECTED_FRONTEND_ORIGINS, set(filter(None, (docker_frontend or '').split(','))) == EXPECTED_FRONTEND_ORIGINS)
+        if EXPECTED_REDIRECT_URI:
+            failures += ok(
+                "DOCKER_GOOGLE_REDIRECT_URI matches",
+                docker_redirect == EXPECTED_REDIRECT_URI,
+                docker_redirect == EXPECTED_REDIRECT_URI,
+            )
+        if EXPECTED_FRONTEND_ORIGINS:
+            failures += ok(
+                "DOCKER_FRONTEND_URL contains expected",
+                set(filter(None, (docker_frontend or "").split(","))) == EXPECTED_FRONTEND_ORIGINS,
+                set(filter(None, (docker_frontend or "").split(","))) == EXPECTED_FRONTEND_ORIGINS,
+            )
     else:
         print("[INFO] Docker runtime env not provided (set DOCKER_GOOGLE_REDIRECT_URI/DOCKER_FRONTEND_URL to compare).")
 

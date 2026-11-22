@@ -27,18 +27,10 @@ const csrfHeaders = () => {
   return token ? { "X-CSRF-Token": token } : {};
 };
 
-export async function beginGoogleLogin(returnTo = window.location.href) {
-  const response = await fetch(
-    `${AUTH_LOGIN_API}?return_to=${encodeURIComponent(returnTo)}`,
-    { credentials: "include" }
+export function beginGoogleLogin(returnTo = window.location.href) {
+  window.location.assign(
+    `${AUTH_LOGIN_API}?return_to=${encodeURIComponent(returnTo)}`
   );
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok || !data.authorization_url) {
-    throw new Error(data.detail || "Google sign-in is not available.");
-  }
-
-  window.location.assign(data.authorization_url);
 }
 
 const REFRESH_LOCK_NAME = "taskflow-refresh-session";

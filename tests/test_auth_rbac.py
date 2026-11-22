@@ -478,10 +478,27 @@ def auth_client(monkeypatch):
     return TestClient(app), settings
 
 
-def test_google_login_returns_google_url_and_sets_http_only_state_cookie(auth_client):
+def test_google_login_redirects_by_default_and_sets_http_only_state_cookie(auth_client):
     client, settings = auth_client
 
-    response = client.get("/auth/google/login", follow_redirects=False)
+    response = client.get("/auth/google/login?return_to=/tasks", follow_redirects=False)
+
+    assert response.status_code == 302
+    location = response.headers["location"]
+    assert location.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+    assert "state=" in location
+    assert "code_challenge=" in location
+    state_cookie = response.cookies.get(settings.oauth_state_cookie_name)
+    assert state_cookie
+    set_cookie = response.headers.get("set-cookie", "")
+    assert settings.oauth_state_cookie_name in set_cookie
+    assert "HttpOnly" in set_cookie
+
+
+def test_google_login_returns_json_when_explicitly_requested(auth_client):
+    client, settings = auth_client
+
+    response = client.get("/auth/google/login?format=json&return_to=/tasks")
 
     assert response.status_code == 200
     data = response.json()
@@ -524,9 +541,107 @@ def test_google_login_fails_safely_when_google_is_not_configured(auth_client):
         google_client_secret="",
     )
 
-    response = client.get("/auth/google/login")
+    response = client.get("/auth/google/login?format=json")
 
     assert response.status_code == 503
+
+
+def _start_google_login(client, settings, return_to="/tasks"):
+    response = client.get(
+        f"/auth/google/login?format=json&return_to={return_to}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 200
+    auth_url = response.json()["authorization_url"]
+    # extract state from URL
+    from urllib.parse import parse_qs, urlparse
+
+    qs = parse_qs(urlparse(auth_url).query)
+    return qs["state"][0], auth_url
+
+
+def test_google_callback_missing_state_cookie_returns_clear_error(auth_client):
+    client, settings = auth_client
+    state, _ = _start_google_login(client, settings)
+    client.cookies.clear()
+
+    response = client.get(
+        f"/auth/google/callback?code=test-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "The Google sign-in session is missing or expired."
+
+
+def test_google_callback_state_mismatch_clears_cookie(auth_client):
+    client, settings = auth_client
+    _start_google_login(client, settings)
+
+    response = client.get(
+        "/auth/google/callback?code=test-code&state=wrong-state",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "The Google sign-in state does not match."
+    set_cookie = response.headers.get("set-cookie", "")
+    assert settings.oauth_state_cookie_name in set_cookie
+    assert "Max-Age=0" in set_cookie or "expires=" in set_cookie.lower()
+
+
+def test_google_callback_missing_code_or_state_is_incomplete(auth_client):
+    client, settings = auth_client
+    _start_google_login(client, settings)
+
+    response = client.get("/auth/google/callback?state=only-state", follow_redirects=False)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "The Google sign-in response is incomplete."
+
+
+def test_google_callback_valid_flow_sets_session_and_redirects(auth_client, monkeypatch):
+    client, settings = auth_client
+    state, _ = _start_google_login(client, settings, return_to="/tasks")
+
+    monkeypatch.setattr(
+        auth_routes,
+        "exchange_code",
+        lambda **kwargs: {"id_token": "google-id-token"},
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "verify_id_token",
+        lambda **kwargs: {
+            "sub": "sub-1",
+            "email": "rahul@example.com",
+            "name": "Rahul",
+        },
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "find_or_link_google_employee",
+        lambda **kwargs: SimpleNamespace(id=7),
+    )
+    monkeypatch.setattr(
+        auth_routes,
+        "create_session",
+        lambda *args, **kwargs: ("refresh-token", SimpleNamespace(id="session-1")),
+    )
+
+    response = client.get(
+        f"/auth/google/callback?code=test-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "http://localhost:5173/tasks"
+    assert client.cookies.get(settings.refresh_cookie_name) == "refresh-token"
+    assert client.cookies.get(settings.csrf_cookie_name)
+    set_cookie_headers = response.headers.get_list("set-cookie")
+    state_cookies = [h for h in set_cookie_headers if settings.oauth_state_cookie_name in h]
+    assert state_cookies
+    assert any("Max-Age=0" in h or "expires=" in h.lower() for h in state_cookies)
 
 
 # --- database agent write authorization ------------------------------------

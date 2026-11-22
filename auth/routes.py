@@ -124,6 +124,7 @@ def _client_details(request: Request) -> tuple[str | None, str | None]:
 def google_login(
     request: Request,
     return_to: str | None = None,
+    format: str | None = None,
 ):
     settings = auth_config.settings
 
@@ -148,17 +149,18 @@ def google_login(
         return_to=target,
         settings=settings,
     )
-
-    response = JSONResponse(
-        {
-            "authorization_url": authorization_url(
-                state=state,
-                nonce=nonce,
-                code_challenge=challenge,
-                settings=settings,
-            )
-        }
+    auth_url = authorization_url(
+        state=state,
+        nonce=nonce,
+        code_challenge=challenge,
+        settings=settings,
     )
+
+    if format == "json":
+        response = JSONResponse({"authorization_url": auth_url})
+    else:
+        response = RedirectResponse(auth_url, status_code=status.HTTP_302_FOUND)
+
     response.set_cookie(
         settings.oauth_state_cookie_name,
         state_token,
@@ -175,27 +177,65 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     state_cookie = request.cookies.get(settings.oauth_state_cookie_name)
 
     if request.query_params.get("error"):
-        return _redirect_error("google_cancelled", settings)
+        response = _redirect_error("google_cancelled", settings)
+        response.delete_cookie(
+            settings.oauth_state_cookie_name,
+            path="/",
+            domain=settings.cookie_domain,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_same_site,
+        )
+        return response
 
-    if not code or not state or not state_cookie:
+    if not code or not state:
+        response = JSONResponse(
+            {"detail": "The Google sign-in response is incomplete."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+        response.delete_cookie(
+            settings.oauth_state_cookie_name,
+            path="/",
+            domain=settings.cookie_domain,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_same_site,
+        )
+        return response
+
+    if not state_cookie:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The Google sign-in response is incomplete.",
+            detail="The Google sign-in session is missing or expired.",
         )
 
     try:
         state_payload = decode_state_token(state_cookie, settings)
     except Exception:
-        raise HTTPException(
+        response = JSONResponse(
+            {"detail": "The Google sign-in state is invalid or expired."},
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The Google sign-in state is invalid or expired.",
         )
+        response.delete_cookie(
+            settings.oauth_state_cookie_name,
+            path="/",
+            domain=settings.cookie_domain,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_same_site,
+        )
+        return response
 
     if not constant_time_equal(state_payload.get("state"), state):
-        raise HTTPException(
+        response = JSONResponse(
+            {"detail": "The Google sign-in state does not match."},
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The Google sign-in state does not match.",
         )
+        response.delete_cookie(
+            settings.oauth_state_cookie_name,
+            path="/",
+            domain=settings.cookie_domain,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_same_site,
+        )
+        return response
 
     try:
         token_response = exchange_code(
@@ -208,8 +248,16 @@ def google_callback(request: Request, code: str | None = None, state: str | None
             nonce=state_payload["nonce"],
             settings=settings,
         )
-    except GoogleAuthError as error:
-        return _redirect_error("google_verification_failed", settings)
+    except GoogleAuthError:
+        response = _redirect_error("google_verification_failed", settings)
+        response.delete_cookie(
+            settings.oauth_state_cookie_name,
+            path="/",
+            domain=settings.cookie_domain,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_same_site,
+        )
+        return response
 
     employee = find_or_link_google_employee(
         google_sub=str(claims["sub"]),
@@ -219,7 +267,15 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     )
 
     if employee is None:
-        return _redirect_error("not_provisioned", settings)
+        response = _redirect_error("not_provisioned", settings)
+        response.delete_cookie(
+            settings.oauth_state_cookie_name,
+            path="/",
+            domain=settings.cookie_domain,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_same_site,
+        )
+        return response
 
     user_agent, ip_address = _client_details(request)
     refresh_token, session_row = create_session(
