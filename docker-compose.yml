@@ -26,13 +26,18 @@ services:
       DB_DISABLE_PREPARED_STATEMENTS: ${DB_DISABLE_PREPARED_STATEMENTS:-0}
       AI_PROVIDER: ${AI_PROVIDER:-cohere}
       COHERE_API_KEY: ${COHERE_API_KEY:?Set COHERE_API_KEY in .env}
+      APP_ENV: ${APP_ENV:-development}
       MCP_ENABLED: ${MCP_ENABLED:-1}
       MCP_TRANSPORT: ${MCP_TRANSPORT:-streamable-http}
       MCP_SERVER_NAME: ${MCP_SERVER_NAME:-fnw-task-manager}
       MCP_PATH: ${MCP_PATH:-/mcp}
       MCP_REQUIRE_AUTH: ${MCP_REQUIRE_AUTH:-1}
       # In-container MCP server URL used by the backend's MCP client adapter.
+      # Keep this local in both development and production.
       MCP_SERVER_URL: ${MCP_SERVER_URL:-http://127.0.0.1:8000/mcp/}
+      # Public MCP resource/origin for protected-resource metadata.
+      MCP_PUBLIC_RESOURCE_URL: ${MCP_PUBLIC_RESOURCE_URL:-}
+      MCP_TUNNEL_ENABLED: ${MCP_TUNNEL_ENABLED:-1}
       MCP_STATELESS: ${MCP_STATELESS:-1}
       MCP_JSON_RESPONSE: ${MCP_JSON_RESPONSE:-1}
       MCP_TOOL_CACHE_SECONDS: ${MCP_TOOL_CACHE_SECONDS:-300}
@@ -158,6 +163,7 @@ services:
       - taskflow
 
   mcp-tunnel:
+    profiles: ["dev", "development"]
     build:
       context: .
       dockerfile: tunnel/Dockerfile

@@ -1,5 +1,12 @@
 # FnW Task Manager MCP Architecture
 
+## Deployment modes
+
+One codebase, one MCP server implementation, two deployment modes:
+
+- **Development**: local Docker Compose + existing OpenAI tunnel client. The tunnel is started explicitly with Compose profile `dev`/`development`.
+- **Production**: Render (or any HTTPS deployment) serves the same FastAPI MCP endpoint directly at `/mcp`. No local tunnel client/container/process is required.
+
 ## What MCP means here
 
 The Model Context Protocol (MCP) is the application's provider-neutral
@@ -14,7 +21,7 @@ the MCP Streamable HTTP transport at:
 POST/GET/DELETE /mcp
 ```
 
-The default deployment mounts it inside the existing FastAPI backend, so no
+The MCP server is mounted inside the existing FastAPI backend, so no
 separate microservice is required.
 
 ## Architecture
@@ -84,33 +91,56 @@ ai/
   MCP session. Every HTTP request carries its own bearer token.
 - The MCP session manager starts in the FastAPI lifespan only when
   `MCP_ENABLED=true`.
+- `MCP_SERVER_URL` is the **internal** MCP adapter URL used by the Cohere/local
+  adapter. Keep it local (`http://127.0.0.1:8000/mcp`) in development and
+  production. Do not point it at the public Render URL.
+- `MCP_PUBLIC_RESOURCE_URL` is the **public** MCP resource/origin used only for
+  OAuth protected-resource metadata (RFC 9728). For production direct HTTPS, set
+  it to `https://fnw-logging-assistant.onrender.com` (or the full
+  `/mcp` URL; the server canonicalizes it).
 
-### Local run
+### Development (local Docker + OpenAI tunnel)
+
+The tunnel client is kept for development but is **not** started by default.
+Start it explicitly with the dev profile:
 
 ```bash
-pip install -r requirements.txt
-MCP_ENABLED=true DATABASE_AGENT=1 AI_PROVIDER=cohere uvicorn app:app --port 8000
+docker compose --profile dev up -d --build
 ```
 
-### Docker
+Development expectations:
+- Backend MCP endpoint: `http://localhost:8000/mcp` (or mapped backend port)
+- `APP_ENV=development`
+- `MCP_TUNNEL_ENABLED=true`
+- `MCP_SERVER_URL=http://127.0.0.1:8000/mcp/`
+- `MCP_PUBLIC_RESOURCE_URL=https://api.openai.com/v1/mcp/<tunnel-id>` (or your tunnel resource URL)
+- Tunnel secrets/files: `CONTROL_PLANE_API_KEY`, `FNW_MCP_AUTHORIZATION_FILE`
 
-The default `docker-compose.yml` uses an external PostgreSQL `DATABASE_URL`
-(Supabase/external DB). It publishes backend port `8000`; `/mcp` is available at
-`http://localhost:8000/mcp`. The Cohere adapter uses
-`MCP_SERVER_URL=http://127.0.0.1:8000/mcp` inside the same container. The MCP
-server runs in-process in the backend and uses the shared SQLAlchemy engine/
-session configuration from `database/connection.py`; it does not create a
-separate database connection or credential set.
+### Production (Render direct HTTPS MCP)
+
+Run the same backend without the tunnel profile/service. Render must expose:
+
+```text
+https://fnw-logging-assistant.onrender.com/mcp
+```
+
+Production expectations:
+- `APP_ENV=production`
+- `MCP_TUNNEL_ENABLED=false`
+- `MCP_REQUIRE_AUTH=true`
+- `MCP_SERVER_URL=http://127.0.0.1:8000/mcp` (internal/local only)
+- `MCP_PUBLIC_RESOURCE_URL=https://fnw-logging-assistant.onrender.com`
+- No `CONTROL_PLANE_API_KEY`, no tunnel profile mount, no `mcp-tunnel` container.
 
 For isolated local PostgreSQL development/testing only:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.local-db.yml --profile dev up -d --build
 ```
 
 ## Authentication and authorization
 
-Every MCP request must send a bearer token:
+MCP auth remains enabled in development and production. Every MCP request must send a bearer token:
 
 ```http
 Authorization: Bearer <token>
@@ -156,14 +186,26 @@ The server resolves the `TaskActor` from the token and executes each tool inside
 Tool discovery is filtered by permission, and execution re-checks the
 permission. Hiding a tool is never treated as authorization.
 
-### OpenClaw (external MCP client)
+### Direct HTTPS MCP clients (production/Render)
+
+For direct Render HTTPS MCP, configure the client with the public endpoint and a dedicated employee-bound `fnw_mcp_` credential:
+
+```text
+URL: https://fnw-logging-assistant.onrender.com/mcp
+Transport: Streamable HTTP
+Authorization: Bearer fnw_mcp_<credential>
+```
+
+Do **not** disable MCP auth on Render. A missing/invalid credential returns 401.
+
+### OpenClaw / tunnel clients (development)
 
 OpenClaw 2026.10.10 can use a static bearer header for Streamable HTTP MCP.
 Configure it with an issued `fnw_mcp_` credential (do not copy browser access
 tokens):
 
 ```bash
-openclaw mcp set fnw '{"url":"https://<tunnel>/mcp/","transport":"streamable-http","headers":{"Authorization":"Bearer fnw_mcp_<credential>"}}'
+openclaw mcp set fnw '{"url":"https://<tunnel-or-public-mcp>/mcp/","transport":"streamable-http","headers":{"Authorization":"Bearer fnw_mcp_<credential>"}}'
 openclaw mcp doctor fnw --probe
 ```
 

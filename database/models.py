@@ -197,13 +197,81 @@ class MCPClientCredential(Base):
     employee = relationship(
         "Employee",
         foreign_keys=[employee_id],
-        lazy="joined",
     )
 
-    created_by = relationship(
-        "Employee",
-        foreign_keys=[created_by_employee_id],
+
+class MCPOAuthClient(Base):
+    """Registered OAuth client for MCP (DCR, RFC 7591)."""
+
+    __tablename__ = "mcp_oauth_clients"
+
+    client_id = Column(String(255), primary_key=True)
+    client_name = Column(String(255), nullable=True)
+    redirect_uris = Column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=list)
+    token_endpoint_auth_method = Column(String(64), nullable=False, default="none")
+    grant_types = Column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=list)
+    response_types = Column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=list)
+    scope = Column(Text, nullable=True)
+    client_uri = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
+class MCPOAuthCode(Base):
+    """Short-lived OAuth authorization code for MCP ChatGPT clients.
+
+    The plaintext code is never stored. Only a hash is persisted.
+    """
+
+    __tablename__ = "mcp_oauth_codes"
+
+    id = Column(String(36), primary_key=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
+    client_id = Column(String(255), nullable=False, index=True)
+    code_hash = Column(String(64), nullable=False, unique=True, index=True)
+    redirect_uri = Column(Text, nullable=False)
+    scope = Column(Text, nullable=True)
+    code_challenge = Column(String(255), nullable=False)
+    code_challenge_method = Column(String(16), nullable=False, default="S256")
+    resource = Column(Text, nullable=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    used_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    employee = relationship("Employee")
+
+
+class MCPOAuthSession(Base):
+    """Refreshable MCP OAuth session for a ChatGPT/remote MCP client."""
+
+    __tablename__ = "mcp_oauth_sessions"
+
+    id = Column(String(36), primary_key=True)
+    employee_id = Column(
+        Integer,
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    client_id = Column(String(255), nullable=False, index=True)
+    scope = Column(Text, nullable=True)
+    resource = Column(Text, nullable=True)
+    refresh_token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    access_jti = Column(String(64), nullable=True, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True, index=True)
+    replaced_by_session_id = Column(String(36), nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+
+    employee = relationship("Employee")
 
 
 class Task(Base):

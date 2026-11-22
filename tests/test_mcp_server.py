@@ -424,7 +424,7 @@ def test_unauthenticated_mcp_requests_get_401(mcp_env):
     )
 
     assert response.status_code == 401
-    assert response.headers["www-authenticate"] == "Bearer"
+    assert 'resource_metadata=' in response.headers["www-authenticate"]
     assert response.json()["error"] == "unauthorized"
 
 

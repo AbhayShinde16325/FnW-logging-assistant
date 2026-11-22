@@ -18,7 +18,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
-from mcp_server.configuration import load_mcp_settings
+from mcp_server.configuration import load_mcp_settings, normalize_public_mcp_resource_url
 from mcp_server.prompts.agent_prompts import get_prompt, list_prompts
 from mcp_server.registry.tool_registry import MCPToolSpec, tool_registry
 from mcp_server.resources.skill_resources import ALL_RESOURCE_MAP, list_resources
@@ -90,7 +90,10 @@ def _mcp_tool(spec: MCPToolSpec) -> Tool:
         inputSchema=spec.input_schema,
         outputSchema=spec.output_schema,
         annotations=_tool_annotations(spec),
-        _meta={"fnw/permissions": sorted(spec.permissions)},
+        _meta={
+            "fnw/permissions": sorted(spec.permissions),
+            "securitySchemes": [{"type": "oauth2", "scopes": ["mcp:tools"]}],
+        },
     )
 
 
@@ -218,13 +221,16 @@ def _public_resource_url(request) -> str | None:
     identify the public MCP resource, not the internal Docker address.
     """
 
-    configured = (settings.public_resource_url or "").strip().rstrip("/")
+    configured = normalize_public_mcp_resource_url(
+        settings.public_resource_url,
+        mcp_path=settings.path,
+    )
     if configured:
         return configured
 
     # Fallback: infer from request headers. Safe only when behind a trusted
     # proxy that sets X-Forwarded-* correctly; operators should set
-    # MCP_PUBLIC_RESOURCE_URL explicitly for tunnel deployments.
+    # MCP_PUBLIC_RESOURCE_URL explicitly for public deployments.
     forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
     host = forwarded_host or (request.headers.get("host") or "").strip()
     if not host:
@@ -239,13 +245,19 @@ def _protected_resource_metadata(request) -> dict | None:
     if not resource:
         return None
 
-    # This server uses static dedicated MCP bearer credentials (fnw_mcp_*),
-    # not OAuth authorization-code/PKCE. We advertise the protected resource
-    # and supported bearer method; we intentionally do not claim authorization
-    # servers we do not implement.
+    # MCP supports dedicated static credentials and OAuth-issued MCP access tokens.
+    # Authorization server metadata is hosted by this same FastAPI app.
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(resource)
+    issuer = urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
     return {
         "resource": resource,
-        "authorization_servers": [],
+        "authorization_servers": [issuer],
+        "authorization_endpoint": f"{issuer}/oauth/authorize",
+        "token_endpoint": f"{issuer}/oauth/token",
+        "registration_endpoint": f"{issuer}/oauth/register",
+        "scopes_supported": ["mcp:tools"],
         "bearer_methods_supported": ["header"],
         "resource_name": settings.server_name,
     }

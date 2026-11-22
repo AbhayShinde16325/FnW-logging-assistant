@@ -82,16 +82,29 @@ def execution_context_from_token(token: str | None) -> MCPExecutionContext:
         MCPCredentialValidationError,
         resolve_employee_for_mcp_credential,
     )
+    from auth.mcp_oauth import MCPOAuthError, validate_mcp_oauth_access_token
 
-    if not token.startswith(MCP_CREDENTIAL_PREFIX):
-        raise MCPAuthenticationError(
-            "A dedicated MCP credential is required."
+    if token.startswith(MCP_CREDENTIAL_PREFIX):
+        try:
+            employee, _credential_id = resolve_employee_for_mcp_credential(token)
+        except MCPCredentialValidationError as error:
+            raise MCPAuthenticationError(str(error)) from error
+        return MCPExecutionContext(
+            employee=employee,
+            actor=TaskActor.from_employee(employee),
+            access_token=token,
         )
 
+    # ChatGPT/remote MCP OAuth access token (JWT, MCP-specific type).
     try:
-        employee, _credential_id = resolve_employee_for_mcp_credential(token)
-    except MCPCredentialValidationError as error:
-        raise MCPAuthenticationError(str(error)) from error
+        from mcp_server.configuration import load_mcp_settings
+        expected_resource = (load_mcp_settings().public_resource_url or "").strip() or None
+        employee, _session_id = validate_mcp_oauth_access_token(token, expected_resource=expected_resource)
+    except MCPOAuthError as error:
+        logger.warning("MCP OAuth token rejected: %s", error.error)
+        raise MCPAuthenticationError("A valid MCP credential or OAuth token is required.") from error
+    except Exception:
+        raise MCPAuthenticationError("A valid MCP credential or OAuth token is required.")
 
     return MCPExecutionContext(
         employee=employee,
@@ -109,7 +122,7 @@ def _rejection_reason(headers, error: MCPAuthenticationError) -> str:
     if not diagnostics["bearer_scheme"]:
         return "invalid_or_missing_bearer_token"
     if not diagnostics["mcp_prefix"]:
-        return "token_missing_fnw_mcp_prefix"
+        return "non_mcp_credential_bearer"
 
     if "required" in detail.lower():
         return "authentication_required"

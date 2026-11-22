@@ -17,6 +17,8 @@ from auth.config import AuthSettings
 ALGORITHM = "HS256"
 STATE_TYPE = "oauth_state"
 ACCESS_TYPE = "access"
+MCP_OAUTH_CODE_TYPE = "mcp_oauth_code"
+MCP_OAUTH_ACCESS_TYPE = "mcp_oauth_access"
 
 
 def utcnow() -> datetime:
@@ -104,6 +106,7 @@ def create_state_token(
     return_to: str,
     settings: AuthSettings,
     now: datetime | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> str:
     issued_at = now or utcnow()
 
@@ -116,6 +119,8 @@ def create_state_token(
         "iat": issued_at.replace(tzinfo=timezone.utc),
         "exp": (issued_at + timedelta(minutes=10)).replace(tzinfo=timezone.utc),
     }
+    if extra:
+        payload.update(extra)
 
     return jwt.encode(payload, _require_secret(settings), algorithm=ALGORITHM)
 
@@ -132,6 +137,60 @@ def decode_state_token(token: str, settings: AuthSettings) -> dict[str, Any]:
     if payload.get("type") != STATE_TYPE:
         raise jwt.InvalidTokenError("Unexpected state token type.")
 
+    return payload
+
+
+def create_mcp_oauth_access_token(
+    *,
+    employee_id: int,
+    email: str,
+    role: str,
+    permissions: list[str] | set[str],
+    session_id: str,
+    client_id: str,
+    scope: str,
+    resource: str,
+    settings: AuthSettings,
+    now: datetime | None = None,
+    ttl_minutes: int | None = None,
+) -> tuple[str, datetime, str]:
+    issued_at = now or utcnow()
+    minutes = ttl_minutes or max(5, min(settings.access_token_minutes, 60))
+    expires_at = issued_at + timedelta(minutes=minutes)
+    jti = secrets.token_urlsafe(16)
+    payload = {
+        "sub": str(employee_id),
+        "email": email,
+        "role": role,
+        "permissions": sorted(permissions),
+        "sid": session_id,
+        "client_id": client_id,
+        "scope": scope,
+        "resource": resource,
+        "type": MCP_OAUTH_ACCESS_TYPE,
+        "iss": settings.issuer,
+        "aud": resource,
+        "iat": issued_at.replace(tzinfo=timezone.utc),
+        "nbf": issued_at.replace(tzinfo=timezone.utc),
+        "exp": expires_at.replace(tzinfo=timezone.utc),
+        "jti": jti,
+    }
+    token = jwt.encode(payload, _require_secret(settings), algorithm=ALGORITHM)
+    return token, expires_at, jti
+
+
+def decode_mcp_oauth_access_token(token: str, settings: AuthSettings, *, audience: str | None = None) -> dict[str, Any]:
+    payload = jwt.decode(
+        token,
+        _require_secret(settings),
+        algorithms=[ALGORITHM],
+        audience=audience or settings.audience,
+        issuer=settings.issuer,
+        options={"require": ["exp", "iat", "sub", "iss", "aud", "sid", "jti"]},
+        leeway=10,
+    )
+    if payload.get("type") != MCP_OAUTH_ACCESS_TYPE:
+        raise jwt.InvalidTokenError("Unexpected MCP OAuth token type.")
     return payload
 
 

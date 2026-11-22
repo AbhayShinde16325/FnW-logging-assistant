@@ -17,6 +17,35 @@ class MCPAuthenticationMiddleware:
         self.app = app
         self.settings = settings
 
+    def _resource_metadata_url(self, request: Request) -> str | None:
+        try:
+            from mcp_server.server import _metadata_paths, _public_resource_url
+
+            resource = _public_resource_url(request)
+            if not resource:
+                return None
+            path_specific, _root = _metadata_paths(self.settings.path)
+            # RFC 9728 protected resource metadata endpoint
+            from urllib.parse import urlsplit, urlunsplit
+
+            p = urlsplit(resource)
+            return urlunsplit((p.scheme, p.netloc, path_specific, "", ""))
+        except Exception:
+            return None
+
+    def _www_authenticate(self, request: Request, error: MCPAuthenticationError) -> str:
+        meta = self._resource_metadata_url(request)
+        parts = ['Bearer realm="fnw-mcp"']
+        detail = str(error).lower()
+        if "required" in detail or "missing" in detail:
+            parts.append('error="invalid_token"')
+        else:
+            parts.append('error="invalid_token"')
+        parts.append(f'error_description="{str(error)}"')
+        if meta:
+            parts.append(f'resource_metadata="{meta}"')
+        return ", ".join(parts)
+
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http" and self.settings.require_auth:
             request = Request(scope, receive)
@@ -27,7 +56,7 @@ class MCPAuthenticationMiddleware:
                 response = JSONResponse(
                     {"error": "unauthorized", "detail": str(error)},
                     status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
+                    headers={"WWW-Authenticate": self._www_authenticate(request, error)},
                 )
                 await response(scope, receive, send)
                 return

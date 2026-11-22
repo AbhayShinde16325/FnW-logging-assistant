@@ -22,6 +22,12 @@ from auth.security import (
     random_token,
     safe_return_to,
 )
+from auth.mcp_oauth import (
+    MCPOAuthError,
+    MCPAuthorizationRequest,
+    issue_authorization_code,
+    parse_authorization_request,
+)
 from auth.service import (
     AuthenticationError,
     AuthenticatedEmployee,
@@ -286,6 +292,38 @@ def google_callback(request: Request, code: str | None = None, state: str | None
             secure=settings.cookie_secure,
             samesite=settings.cookie_same_site,
         )
+        return response
+
+    # MCP OAuth flow: issue MCP authorization code bound to verified employee,
+    # then redirect back to MCP client redirect_uri. Do not create browser
+    # refresh/session cookies for this flow.
+    if state_payload.get("mcp_oauth") and isinstance(state_payload.get("mcp"), dict):
+        try:
+            mcp_req = MCPAuthorizationRequest(
+                response_type="code",
+                client_id=str(state_payload["mcp"].get("client_id") or ""),
+                redirect_uri=str(state_payload["mcp"].get("redirect_uri") or ""),
+                state=str(state_payload["mcp"].get("state") or ""),
+                scope=str(state_payload["mcp"].get("scope") or "mcp:tools"),
+                code_challenge=str(state_payload["mcp"].get("code_challenge") or ""),
+                code_challenge_method=str(state_payload["mcp"].get("code_challenge_method") or "S256"),
+                resource=(str(state_payload["mcp"].get("resource")) if state_payload["mcp"].get("resource") else None),
+            )
+            code = issue_authorization_code(employee_id=employee.id, request=mcp_req, settings=settings)
+        except MCPOAuthError as error:
+            response = JSONResponse(
+                {"error": error.error, "error_description": error.description},
+                status_code=error.status_code,
+            )
+            response.delete_cookie(settings.oauth_state_cookie_name, path="/", domain=settings.cookie_domain, secure=settings.cookie_secure, samesite=settings.cookie_same_site)
+            return response
+
+        from urllib.parse import urlencode
+        from auth.mcp_oauth import canonical_issuer
+
+        redirect = f"{mcp_req.redirect_uri}?{urlencode({'code': code, 'state': mcp_req.state, 'iss': canonical_issuer(settings)})}"
+        response = RedirectResponse(redirect, status_code=302)
+        response.delete_cookie(settings.oauth_state_cookie_name, path="/", domain=settings.cookie_domain, secure=settings.cookie_secure, samesite=settings.cookie_same_site)
         return response
 
     user_agent, ip_address = _client_details(request)

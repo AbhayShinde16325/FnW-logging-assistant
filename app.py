@@ -55,6 +55,7 @@ from auth.permissions import (
 from auth.routes import router as auth_router
 from auth.employee_routes import router as employees_router
 from auth.mcp_credential_routes import router as mcp_credentials_router
+from auth.mcp_oauth_routes import router as mcp_oauth_router
 from notification_routes import router as notifications_router
 from auth.service import AuthenticatedEmployee
 from database.sql_execution import confirmation_phrase, validate_confirmation
@@ -89,14 +90,29 @@ async def lifespan(app: FastAPI):
 
     if mcp_settings.enabled:
         # Reconcile after migrations/schema setup and before MCP requests are served.
-        from auth.mcp_credentials import reconcile_bootstrap_mcp_credential
+        # Bootstrap credentials are a development/tunnel convenience; production
+        # direct HTTPS MCP should use explicitly issued credentials.
+        if mcp_settings.tunnel_enabled and not mcp_settings.is_production:
+            from auth.mcp_credentials import reconcile_bootstrap_mcp_credential
 
-        reconcile_bootstrap_mcp_credential()
+            reconcile_bootstrap_mcp_credential()
+        else:
+            logger.info(
+                "Skipping MCP bootstrap credential reconciliation "
+                "(APP_ENV=%s, MCP_TUNNEL_ENABLED=%s).",
+                mcp_settings.app_env,
+                mcp_settings.tunnel_enabled,
+            )
 
         from mcp_server.server import mcp_lifespan
 
         async with mcp_lifespan():
-            logger.info("MCP server started at %s.", mcp_settings.path)
+            logger.info(
+                "MCP server started at %s (APP_ENV=%s, tunnel=%s).",
+                mcp_settings.path,
+                mcp_settings.app_env,
+                mcp_settings.tunnel_enabled,
+            )
             yield
     else:
         yield
@@ -112,6 +128,7 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+app.include_router(mcp_oauth_router)
 app.include_router(mcp_credentials_router)
 app.include_router(employees_router)
 app.include_router(notifications_router)

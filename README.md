@@ -148,30 +148,26 @@ it in `.env`.
 
 ## MCP server and provider-independent AI
 
-The application exposes its task, employee, notification, read-only database
-and conversation capabilities through a central Model Context Protocol server
-at `/mcp/` (Streamable HTTP). Cohere discovers those tools through MCP; the
-business logic stays in the existing services.
+One MCP server implementation supports two modes:
+
+- **Development**: local Docker + OpenAI tunnel client (`docker compose --profile dev up -d --build`).
+- **Production**: Render direct HTTPS MCP endpoint at `https://fnw-logging-assistant.onrender.com/mcp` (no tunnel client/container).
 
 ```env
+APP_ENV=development|production
 MCP_ENABLED=true
 MCP_TRANSPORT=streamable-http
 MCP_SERVER_NAME=fnw-task-manager
-MCP_SERVER_URL=http://127.0.0.1:8000/mcp
-AI_PROVIDER=cohere
+MCP_PATH=/mcp
+MCP_REQUIRE_AUTH=true
+MCP_SERVER_URL=http://127.0.0.1:8000/mcp   # internal adapter URL, keep local
+MCP_PUBLIC_RESOURCE_URL=https://fnw-logging-assistant.onrender.com  # production metadata URL
+MCP_TUNNEL_ENABLED=true|false
 ```
 
-External MCP clients (e.g. OpenClaw 2026.10.10) should use a dedicated,
-revocable MCP client credential issued to an active employee via
-`POST /auth/mcp-credentials` (plaintext shown once; only a SHA-256 hash is
-stored). Configure the client with
-`Authorization: Bearer fnw_mcp_<credential>` over HTTPS. Browser JWT/session
-authentication, refresh/CSRF/session-rotation and reuse-detection, and
-Cohere's local MCP URL/flow remain unchanged.
+`MCP_SERVER_URL` is internal-only for the Cohere/local MCP adapter. `MCP_PUBLIC_RESOURCE_URL` is used only for OAuth protected-resource metadata. MCP auth remains enabled in both modes.
 
-See [docs/MCP_ARCHITECTURE.md](docs/MCP_ARCHITECTURE.md) for the architecture,
-authentication requirements, tool/resource/prompt catalog, external client
-setup, Docker deployment and how to add a future provider.
+See [docs/MCP_ARCHITECTURE.md](docs/MCP_ARCHITECTURE.md) for dev/prod commands, Render env vars, tunnel dev vars, auth model, and ChatGPT/direct MCP connection steps.
 
 ## Authentication and roles
 
