@@ -1,0 +1,45 @@
+name: task-flow-automations
+
+# Optional local PostgreSQL for development/testing only.
+# Use with the default external-DB compose file:
+#   docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build
+# This file is intentionally isolated from the default Supabase/external DB path.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-fnw_task_logger}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_DB:-fnw_task_logger}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - taskflow
+
+  backend:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-fnw_task_logger}
+
+  reminder-worker:
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-fnw_task_logger}
+
+volumes:
+  postgres_data:

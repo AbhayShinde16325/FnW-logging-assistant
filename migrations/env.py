@@ -7,7 +7,11 @@ from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
-from database.connection import Base
+from database.connection import (
+    Base,
+    database_connect_args,
+    normalize_database_url,
+)
 from database import models  # noqa: F401  (register metadata)
 
 load_dotenv()
@@ -17,10 +21,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.getenv("DATABASE_URL")
+database_url = os.getenv("DATABASE_URL", "").strip()
 
 if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+    normalized = normalize_database_url(database_url)
+    # Keep % escapes intact for ConfigParser interpolation.
+    config.set_main_option("sqlalchemy.url", normalized.replace("%", "%%"))
 
 target_metadata = Base.metadata
 
@@ -39,10 +45,15 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    section = config.get_section(config.config_ini_section, {})
+    configured_url = section.get("sqlalchemy.url") or os.getenv("DATABASE_URL", "")
+    connect_args = database_connect_args(configured_url)
+
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        section,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
 
     with connectable.connect() as connection:

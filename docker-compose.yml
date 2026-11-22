@@ -1,37 +1,29 @@
 name: task-flow-automations
 
-services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: ${POSTGRES_DB:-fnw_task_logger}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_DB:-fnw_task_logger}"
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    networks:
-      - taskflow
+# Default deployment uses an external PostgreSQL database (Supabase) via DATABASE_URL.
+# For isolated local development/testing with a local Postgres container, use:
+#   docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build
 
+services:
   backend:
     build:
       context: .
       dockerfile: Dockerfile
     image: task-flow-automations-backend:latest
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
-      # The database host is the compose service name, not localhost.
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-fnw_task_logger}
+      # Centralized database configuration. Provide DATABASE_URL via .env or
+      # deployment secret manager; never hardcode credentials.
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      # Optional SQLAlchemy engine tuning / Supabase pooler compatibility.
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-1}
+      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-10}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-}
+      DB_SSLMODE: ${DB_SSLMODE:-}
+      DB_DISABLE_PREPARED_STATEMENTS: ${DB_DISABLE_PREPARED_STATEMENTS:-0}
       AI_PROVIDER: ${AI_PROVIDER:-cohere}
       COHERE_API_KEY: ${COHERE_API_KEY:?Set COHERE_API_KEY in .env}
       MCP_ENABLED: ${MCP_ENABLED:-1}
@@ -103,13 +95,19 @@ services:
     image: task-flow-automations-backend:latest
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_healthy
       backend:
         condition: service_healthy
     command: ["python", "-m", "reminder_worker"]
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-fnw_task_logger}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-1}
+      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-10}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-}
+      DB_SSLMODE: ${DB_SSLMODE:-}
+      DB_DISABLE_PREPARED_STATEMENTS: ${DB_DISABLE_PREPARED_STATEMENTS:-0}
       TZ: ${TZ:-Asia/Kolkata}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8088,http://localhost:5173}
       RUN_MIGRATIONS: "0"
@@ -194,7 +192,6 @@ services:
       - taskflow
 
 volumes:
-  postgres_data:
   whisper_cache:
 
 networks:

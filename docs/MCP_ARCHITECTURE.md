@@ -94,9 +94,19 @@ MCP_ENABLED=true DATABASE_AGENT=1 AI_PROVIDER=cohere uvicorn app:app --port 8000
 
 ### Docker
 
-The backend service in `docker-compose.yml` publishes port `8000`; `/mcp` is
-available at `http://localhost:8000/mcp`. The Cohere adapter uses
-`MCP_SERVER_URL=http://127.0.0.1:8000/mcp` inside the same container.
+The default `docker-compose.yml` uses an external PostgreSQL `DATABASE_URL`
+(Supabase/external DB). It publishes backend port `8000`; `/mcp` is available at
+`http://localhost:8000/mcp`. The Cohere adapter uses
+`MCP_SERVER_URL=http://127.0.0.1:8000/mcp` inside the same container. The MCP
+server runs in-process in the backend and uses the shared SQLAlchemy engine/
+session configuration from `database/connection.py`; it does not create a
+separate database connection or credential set.
+
+For isolated local PostgreSQL development/testing only:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build
+```
 
 ## Authentication and authorization
 

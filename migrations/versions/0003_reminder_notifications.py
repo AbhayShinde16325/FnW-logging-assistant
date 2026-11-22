@@ -1,7 +1,7 @@
 """Add reminder notifications, push subscriptions and employee timezone.
 
 Revision ID: 0003_reminder_notifications
-Revises: 0002_rbac_task_policy
+Revises: 0002a_create_core_tables
 Create Date: 2026-11-17
 
 The migration is additive and guarded by inspector checks, so it is safe for
@@ -16,7 +16,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "0003_reminder_notifications"
-down_revision: Union[str, None] = "0002_rbac_task_policy"
+down_revision: Union[str, None] = "0002a_create_core_tables"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

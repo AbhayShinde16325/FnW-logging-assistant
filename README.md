@@ -24,9 +24,11 @@ cd FnW-logging-assistant
 cp .env.example .env
 ```
 
-Set `POSTGRES_PASSWORD`, `COHERE_API_KEY`, `AUTH_SECRET_KEY`,
-`GOOGLE_CLIENT_ID`, and `GOOGLE_CLIENT_SECRET` in `.env`. To enable browser
-push, also generate a VAPID key pair:
+Set `DATABASE_URL` (Supabase/external PostgreSQL), `COHERE_API_KEY`,
+`AUTH_SECRET_KEY`, `GOOGLE_CLIENT_ID`, and `GOOGLE_CLIENT_SECRET` in `.env`.
+For Render/external IPv4 deployments, prefer a Supabase **Session Pooler**
+URI if direct connectivity is incompatible. Do not assume transaction pooling.
+To enable browser push, also generate a VAPID key pair:
 
 ```bash
 # 2. Generate VAPID keys, merge the values into .env, and delete the temp file
@@ -36,11 +38,17 @@ python scripts/generate_vapid_keys.py --env-out /tmp/vapid.env
 Then start everything:
 
 ```bash
-# 3. Build and start PostgreSQL, the API, the reminder worker, and the web UI
+# 3. Build and start the API, reminder worker, frontend, and tunnel (external DB)
 docker compose up -d --build
 
 # 4. Provision the first administrator (once)
 docker compose exec backend python -m auth.bootstrap --email you@example.com
+```
+
+For isolated local development with a local PostgreSQL container:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build
 ```
 
 Then open `http://<server-ip>:8080` and sign in with Google. See
@@ -81,15 +89,17 @@ cp .env.example .env
 Set at least these values in `.env`:
 
 ```env
-POSTGRES_PASSWORD=change_me
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/postgres
 COHERE_API_KEY=your_cohere_api_key_here
 AUTH_SECRET_KEY=generate_a_long_random_value
 GOOGLE_CLIENT_ID=your_google_oauth_client_id
 GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
 ```
 
-Docker Compose builds `DATABASE_URL` automatically and points it at the `db`
-service, so it does not have to be edited for the Docker deployment.
+The default Docker Compose file uses this external `DATABASE_URL` (Supabase).
+It does **not** start a local PostgreSQL container. For local isolated
+development/testing, use `docker-compose.local-db.yml`, which provides a local
+`db` service and overrides `DATABASE_URL` for backend/reminder-worker only.
 
 Optional settings:
 
@@ -237,14 +247,16 @@ alembic upgrade head
 ```
 
 The backend container runs `alembic upgrade head` automatically before
-startup (`RUN_MIGRATIONS=1` by default). Existing task rows and volumes are
-preserved. `0001_auth_rbac` creates the auth/RBAC tables and nullable
-employee-id columns; `0002_rbac_task_policy` updates the canonical role
-mappings and safely backfills ownership ids; `0003_reminder_notifications`
-adds `employees.timezone`, `notifications`, and `push_subscriptions` with
-additive inspector-guarded changes.
-`0004_intelligent_notification_fields` adds notification `priority`,
-`voice_text`, and `payload` metadata for attention/prioritization.
+startup (`RUN_MIGRATIONS=1` by default). The reminder worker uses the same
+`DATABASE_URL` but must keep `RUN_MIGRATIONS=0` so only one startup process
+runs migrations. Existing task rows and volumes are preserved. `0001_auth_rbac`
+creates the auth/RBAC tables and nullable employee-id columns;
+`0002_rbac_task_policy` updates the canonical role mappings and safely
+backfills ownership ids; `0003_reminder_notifications` adds
+`employees.timezone`, `notifications`, and `push_subscriptions` with additive
+inspector-guarded changes. `0004_intelligent_notification_fields` adds
+notification `priority`, `voice_text`, and `payload` metadata for
+attention/prioritization.
 
 ### Reminder notifications and Web Push
 
