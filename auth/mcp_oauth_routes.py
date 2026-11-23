@@ -45,10 +45,29 @@ def oauth_authorize(request: Request):
     if not settings.google_configured:
         raise HTTPException(status_code=503, detail="Google sign-in is not configured.")
 
+    raw = dict(request.query_params)
     try:
-        mcp_request = parse_authorization_request(dict(request.query_params), settings=settings)
+        mcp_request = parse_authorization_request(raw, settings=settings)
     except MCPOAuthError as error:
-        raise HTTPException(status_code=error.status_code, detail=error.description)
+        # RFC 9207: include iss in authorization responses when redirecting.
+        redirect_uri = str(raw.get("redirect_uri") or "").strip()
+        state = str(raw.get("state") or "").strip()
+        client_id = str(raw.get("client_id") or "").strip()
+        if redirect_uri and state and client_id:
+            try:
+                from auth.mcp_oauth import canonical_issuer, require_registered_client
+                client = require_registered_client(client_id)
+                if redirect_uri in (client.redirect_uris or []):
+                    q = urlencode({
+                        "error": error.error,
+                        "error_description": error.description,
+                        "state": state,
+                        "iss": canonical_issuer(settings),
+                    })
+                    return RedirectResponse(f"{redirect_uri}?{q}", status_code=302)
+            except Exception:
+                pass
+        return JSONResponse(status_code=error.status_code, content={"error": error.error, "error_description": error.description})
 
     verifier, challenge = pkce_pair()
     google_state = random_token(32)
@@ -102,7 +121,7 @@ def oauth_mcp_callback(request: Request):
     state = params.get("state")
     if error:
         if redirect_uri and state:
-            q = urlencode({"error": "access_denied", "state": state})
+            q = urlencode({"error": "access_denied", "error_description": str(params.get("error_description") or "Authorization failed."), "state": state, "iss": canonical_issuer(settings)})
             return RedirectResponse(f"{redirect_uri}?{q}", status_code=302)
         raise HTTPException(status_code=400, detail="OAuth authorization failed.")
 
