@@ -394,7 +394,40 @@ Exit PostgreSQL:
 \q
 ```
 
-## 5. Local Development without Docker
+## 5. Local Development with Docker Compose
+
+The repository includes `docker-compose.yml` for the default external-database stack and `docker-compose.local-db.yml` as an overlay for isolated local PostgreSQL development.
+
+For the dev stack with attached logs and the MCP tunnel enabled, run this from the project root:
+
+```bash
+docker compose --profile dev up
+```
+
+**What it does:**
+- `--profile dev` enables services configured under the `dev` Docker Compose profile in `docker-compose.yml`. In the current Compose configuration, that includes `mcp-tunnel` (also profiled as `development`).
+- `up` creates and starts the configured containers and attaches the terminal to their logs.
+- With the current Compose configuration, this starts `backend`, `frontend`, `reminder-worker`, and `mcp-tunnel`. The default backend/frontend/reminder-worker services start because they have no profile; `mcp-tunnel` starts because the `dev` profile is enabled.
+- Use `Ctrl+C` to stop the attached Compose process. This stops the attached services; containers may remain stopped rather than being removed. Inspect state with `docker compose ps`; use `docker compose down` only when you intentionally want to remove Compose-managed containers/network.
+
+**Illustrative startup output:**
+
+```text
+Network task-flow-automations_taskflow Created
+Container task-flow-automations-backend-1 Created
+Container task-flow-automations-frontend-1 Created
+Container task-flow-automations-reminder-worker-1 Created
+Attaching to backend-1, frontend-1, mcp-tunnel-1, reminder-worker-1
+```
+
+**Important startup observations:**
+1. `RUN_MIGRATIONS disabled; skipping Alembic migrations.` means automatic Alembic migrations were skipped by the container entrypoint. Do **not** describe this as migrations having run successfully. If schema changes must be applied, run `alembic upgrade head` intentionally using the project's migration strategy.
+2. `Database initialized successfully` and `Database tables created successfully` indicate that the application's database initialization/table-creation process completed successfully. Treat this as application-level initialization; it is separate from Alembic migration execution.
+3. Docker's orphan-container warning about `task-flow-automations-db-1` means a container exists for this Compose project but is not defined in the current Compose configuration. Investigate it before removing it (for example, confirm whether it was created by `docker-compose.local-db.yml` or an older workflow and whether it contains needed local data). Do **not** recommend or run `docker compose down --remove-orphans` blindly, because it may remove a container still needed by the developer.
+
+**Dev tunnel prerequisites:** the `mcp-tunnel` service requires tunnel configuration/secrets, including `CONTROL_PLANE_API_KEY` and the mounted tunnel profile/authorization files described in `.env.example` and `docker-compose.yml`. For the detached core stack without the tunnel, use `docker compose up -d --build`. For isolated local PostgreSQL development, use `docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build`.
+
+## 6. Local Development without Docker
 
 Use this only when running the backend and frontend directly on the machine.
 For a server deployment, use [Run with Docker](#3-run-with-docker-recommended)
@@ -454,7 +487,7 @@ is not reachable. They only add rows and change the rows they added
 themselves: every row carries a unique tag, and no test ever deletes a
 record.
 
-## 6. Application Workflow
+## 7. Application Workflow
 
 1. **Intent detection** – `ai/intent_detection.py` classifies the message as
    `CREATE_TASK`, `UPDATE_TASK`, `GET_TASK`, `LIST_TASKS`, `DELETE_TASK`,
@@ -592,7 +625,7 @@ that is not a number) is rejected by the model, never converted into another
 value and never into another action.
 
 
-## 7. API Endpoints
+## 8. API Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -684,7 +717,7 @@ the body above.
 - The SQL generation skill (`.agents/skills/sql-generation/SKILL.md`) is
   implemented in Python, so the running API obeys the same rules.
 
-## 8. Docker Operations Reference
+## 9. Docker Operations Reference
 
 | Task | Command |
 | --- | --- |

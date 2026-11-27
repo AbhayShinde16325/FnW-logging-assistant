@@ -623,11 +623,36 @@ cp .env.example .env
 docker compose -f docker-compose.yml -f docker-compose.local-db.yml up -d --build
 ```
 
-### 8.4 Dev MCP tunnel profile
+### 8.4 Dev Docker Compose startup (attached logs, includes MCP tunnel)
+
+Use this command from the project root when you want the development stack with the MCP tunnel and attached Compose logs:
+
 ```bash
-docker compose --profile dev up -d --build
-# requires CONTROL_PLANE_API_KEY and tunnel secret files configured
+docker compose --profile dev up
 ```
+
+**What it does:**
+- `--profile dev` enables services configured under the `dev` Docker Compose profile in `docker-compose.yml`. In the current Compose configuration, that includes `mcp-tunnel` (also profiled as `development`).
+- `up` creates and starts the configured containers and attaches the terminal to their logs.
+- With the current Compose configuration, this starts `backend`, `frontend`, `reminder-worker`, and `mcp-tunnel`. The default backend/frontend/reminder-worker services start because they have no profile; `mcp-tunnel` starts because the `dev` profile is enabled.
+- Use `Ctrl+C` to stop the attached Compose process. This stops the attached services; containers may remain stopped rather than being removed. Use `docker compose ps` to inspect status and `docker compose down` only when you intentionally want to remove the Compose-managed containers/network.
+
+**Illustrative startup output:**
+
+```text
+Network task-flow-automations_taskflow Created
+Container task-flow-automations-backend-1 Created
+Container task-flow-automations-frontend-1 Created
+Container task-flow-automations-reminder-worker-1 Created
+Attaching to backend-1, frontend-1, mcp-tunnel-1, reminder-worker-1
+```
+
+**Important startup observations:**
+1. `RUN_MIGRATIONS disabled; skipping Alembic migrations.` means automatic Alembic migrations were skipped by the container entrypoint. Do **not** describe this as migrations having run successfully. If schema changes must be applied, run `alembic upgrade head` intentionally using the project's migration strategy.
+2. `Database initialized successfully` and `Database tables created successfully` indicate that the application's database initialization/table-creation process completed successfully. Treat this as application-level initialization; it is separate from Alembic migration execution.
+3. Docker's orphan-container warning about `task-flow-automations-db-1` means a container exists for this Compose project but is not defined in the current Compose configuration. Investigate it before removing it (for example, confirm whether it was created by `docker-compose.local-db.yml` or an older workflow and whether it contains needed local data). Do **not** recommend or run `docker compose down --remove-orphans` blindly, because it may remove a container still needed by the developer.
+
+**Dev tunnel prerequisites:** the `mcp-tunnel` service requires tunnel configuration/secrets, including `CONTROL_PLANE_API_KEY` and the mounted tunnel profile/authorization files described in `.env.example` and `docker-compose.yml`. If you only need the core app stack without the tunnel, use the non-profile startup commands in sections 8.2 or 8.3.
 
 ### 8.5 Non-Docker backend/frontend dev
 Backend:
