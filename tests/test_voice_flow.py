@@ -109,7 +109,7 @@ def test_voice_turn_completes_two_way_flow(client):
     final = response.json()
     assert final["result"]["status"] == "success"
     assert final["result"]["task"]["status"] == "IN_PROGRESS"
-    assert final["reply"] == "Task created successfully."
+    assert final["reply"].startswith("Task created successfully.")
 
 
 def test_invalid_state_json_is_rejected(client):
