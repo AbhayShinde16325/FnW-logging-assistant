@@ -31,6 +31,11 @@ export function notificationIdFromSearch(search = "") {
   }
 }
 
+export function isFollowupNotification(notification) {
+  const payload = notification?.payload || {};
+  return notification?.notification_type === 'TASK_MISSING_DETAILS' || payload.kind === 'task_missing_details_followup';
+}
+
 export function pushPermissionState({ supported, permission, subscribed }) {
   if (!supported) return "unsupported";
   if (permission === "denied") return "denied";

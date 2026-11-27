@@ -74,7 +74,9 @@ from database.task_repository import (
     run_sql_operation,
     search_tasks,
 )
+from database.connection import SessionLocal
 from services.agentic_read import run_agentic_read
+from services import missing_field_followup, task_management
 from services.conversation_memory import (
     append_history,
     get_conversation_memory,
@@ -169,6 +171,96 @@ CREATE_STAGES = frozenset(
 # follow-up of the conversation, so it may be rewritten into a standalone
 # instruction. Every other stage belongs to a running conversation.
 FRESH_STAGES = frozenset({None, "", "start", STAGE_UPDATE})
+
+WORKFLOW_IDLE = "IDLE"
+WORKFLOW_CREATE_TASK = "CREATE_TASK"
+WORKFLOW_UPDATE_TASK = "UPDATE_TASK"
+WORKFLOW_DELETE_TASK = "DELETE_TASK"
+WORKFLOW_STATUS_COMPLETED = "COMPLETED"
+WORKFLOW_STATUS_CANCELLED = "CANCELLED"
+
+CANCELLATION_PHRASES = (
+    "i don't want to add this task",
+    "i do not want to add this task",
+    "dont want to add this task",
+    "i don't want to create this task",
+    "i do not want to create this task",
+    "dont want to create this task",
+    "i don't want to create it",
+    "i do not want to create it",
+    "dont want to create it",
+    "i don't want to add it",
+    "i do not want to add it",
+    "dont want to add it",
+    "i don't want to do this anymore",
+    "i do not want to do this anymore",
+    "dont want to do this anymore",
+    "cancel this task",
+    "cancel task creation",
+    "cancel the task creation",
+    "cancel this",
+    "abort task creation",
+    "abort this task creation",
+    "never mind",
+    "nevermind",
+    "forget it",
+    "leave it for now",
+    "leave it",
+    "don't proceed",
+    "do not proceed",
+    "dont proceed",
+    "no, don't create it",
+    "no don't create it",
+    "no, do not create it",
+    "i changed my mind",
+    "backtrack",
+    "go back",
+    "stop it",
+    "cancel it",
+    "abort this",
+    "abort",
+    "cancel",
+    "stop",
+)
+
+POST_FOLLOWUP_NEGATIVE_PHRASES = (
+    "nothing else",
+    "that's all",
+    "thats all",
+    "that is all",
+    "that's it",
+    "thats it",
+    "that is it",
+    "i'm good",
+    "im good",
+    "i am good",
+    "not now",
+    "no, thanks",
+    "no thanks",
+    "that's enough",
+    "thats enough",
+    "that is enough",
+    "all done",
+    "you can stop",
+    "no further help needed",
+    "no need",
+    "nope",
+    "nah",
+    "no",
+)
+
+POST_FOLLOWUP_POSITIVE_PHRASES = (
+    "yes please",
+    "yes, please",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "ok",
+    "okay",
+    "please do",
+    "yes",
+)
 
 # A message that can pick one of the displayed task candidates.
 SELECTION_SIGNAL_PATTERN = re.compile(
@@ -2080,7 +2172,7 @@ def _creation_of_result(result: dict) -> dict | None:
     if result.get("intent") != CREATE_TASK:
         return None
 
-    if result.get("status") == "success":
+    if result.get("status") in ("success", "cancelled"):
         return {}
 
     stage = result.get("stage")
@@ -2144,6 +2236,9 @@ def _should_resume_creation(message: str, memory: dict | None) -> bool:
     text = (message or "").strip()
 
     if not text:
+        return False
+
+    if _is_explicit_cancellation(text):
         return False
 
     if is_explicit_create_request(text) or is_explicit_update_request(text):
@@ -2225,6 +2320,9 @@ def _restore_conversation_state(
         return stage, draft
 
     action = clarification.get("action") or "update"
+
+    if _is_explicit_cancellation(message):
+        return stage, draft
 
     is_confirmation = saved_stage == STAGE_CONFIRM_UPDATE and (
         _is_affirmation(message) or _is_negative(message)
@@ -2356,6 +2454,7 @@ def _remember_turn(
     if not identity or not conversation:
         return
 
+    # Do not persist follow-up prompt as a pending clarification; persist user turn normally.
     reply = (result or {}).get("reply") or (result or {}).get("message") or ""
 
     turns = [{"role": "user", "text": user_message}]
@@ -2387,7 +2486,7 @@ def _remember_turn(
         if status == "error":
             # A failed operation never changes the active task or discards an
             # older clarification.
-            context = {}
+            context = {"post_execution_followup": {}}
 
             if pending:
                 context["pending"] = {
@@ -2420,6 +2519,7 @@ def _remember_turn(
                 ),
                 "clarification": clarification or {},
                 "task_creation": creation if creation is not None else {},
+                "post_execution_followup": {},
             }
 
         if agent_trace:
@@ -2452,6 +2552,17 @@ def _remember_turn(
 
     if agent_trace:
         cleared["agent_trace"] = agent_trace[-8:]
+
+    if _is_post_followup_eligible(result):
+        cleared["post_execution_followup"] = {
+            "eligible": True,
+            "asked": True,
+            "answered": False,
+            "operation_intent": intent,
+            "task_id": task_id,
+        }
+    else:
+        cleared["post_execution_followup"] = {}
 
     try:
         if intent == DELETE_TASK:
@@ -2500,6 +2611,7 @@ def _run_database_agent_turn(
     employee: str | None,
     user_id: str | None,
     conversation_id: str | None,
+    notification_context: dict | None = None,
 ) -> dict | None:
     """Let the LLM choose tools for one fresh turn.
 
@@ -2524,6 +2636,7 @@ def _run_database_agent_turn(
             conversation_id=conversation_id,
             memory=memory,
             confirmation=transcript,
+            notification_context=notification_context,
         )
     except Exception:
         logger.exception("The database agent turn failed; using the fallback flow.")
@@ -2588,6 +2701,499 @@ def _is_negative(text: str) -> bool:
         return True
 
     return bool(set(normalized.split()) & NEGATIVE_PHRASES)
+
+
+def _is_explicit_cancellation(text: str) -> bool:
+    normalized = _normalize_voice_text(text)
+    if not normalized:
+        return False
+    # "go back to previous question" is backtracking, not full cancel; handled separately.
+    if re.search(r"\bgo back to\b.*\b(question|step|previous|field)\b", normalized):
+        return False
+    return any(
+        normalized == phrase
+        or normalized.startswith(f"{phrase} ")
+        or normalized.endswith(f" {phrase}")
+        or f" {phrase} " in f" {normalized} "
+        for phrase in CANCELLATION_PHRASES
+    )
+
+
+def _is_backtrack_request(text: str) -> bool:
+    normalized = _normalize_voice_text(text)
+    return bool(re.search(r"\bgo back to\b.*\b(question|step|previous|field)\b", normalized) or normalized in {"go back", "back", "previous question"})
+
+
+def _post_followup_negative(text: str) -> bool:
+    normalized = _normalize_voice_text(text)
+    if not normalized:
+        return False
+    return any(
+        normalized == phrase
+        or normalized.startswith(f"{phrase} ")
+        or normalized.endswith(f" {phrase}")
+        or f" {phrase} " in f" {normalized} "
+        for phrase in POST_FOLLOWUP_NEGATIVE_PHRASES
+    )
+
+
+def _post_followup_positive(text: str) -> bool:
+    normalized = _normalize_voice_text(text)
+    if not normalized:
+        return False
+    # "yes, update..." is a real request, not a generic yes
+    if is_explicit_create_request(text) or is_explicit_update_request(text):
+        return False
+    intent = detect_intent(text).name
+    if intent in (CREATE_TASK, UPDATE_TASK, DELETE_TASK, GET_TASK, LIST_TASKS):
+        return False
+    return any(normalized == phrase for phrase in POST_FOLLOWUP_POSITIVE_PHRASES)
+
+
+def _post_followup_new_request(text: str) -> bool:
+    normalized = _normalize_voice_text(text)
+    if not normalized:
+        return False
+    if _post_followup_negative(normalized) or _post_followup_positive(normalized):
+        return False
+    if is_explicit_create_request(text) or is_explicit_update_request(text):
+        return True
+    intent = detect_intent(text).name
+    return intent in (CREATE_TASK, UPDATE_TASK, DELETE_TASK, GET_TASK, LIST_TASKS)
+
+
+def _workflow_for_result(result: dict) -> dict:
+    result = result or {}
+    status = result.get("status")
+    intent = result.get("intent")
+    stage = result.get("stage")
+    if intent == CREATE_TASK and stage in CREATE_STAGES:
+        return {"active_intent": WORKFLOW_CREATE_TASK, "workflow_status": stage, "last_question": result.get("reply") or result.get("message")}
+    if intent in (UPDATE_TASK, CLARIFICATION_REQUIRED) and stage in UPDATE_STAGES:
+        active = WORKFLOW_DELETE_TASK if stage == STAGE_CONFIRM_DELETE or (result.get("draft") or {}).get("action") == "delete" else WORKFLOW_UPDATE_TASK
+        return {"active_intent": active, "workflow_status": stage, "last_question": result.get("reply") or result.get("message")}
+    if intent == DELETE_TASK and stage == STAGE_CONFIRM_DELETE:
+        return {"active_intent": WORKFLOW_DELETE_TASK, "workflow_status": stage, "last_question": result.get("reply") or result.get("message")}
+    if status == "success" and intent in (CREATE_TASK, UPDATE_TASK, DELETE_TASK):
+        return {"active_intent": intent, "workflow_status": WORKFLOW_STATUS_COMPLETED, "last_question": result.get("reply") or result.get("message")}
+    return {"active_intent": intent, "workflow_status": WORKFLOW_IDLE, "last_question": result.get("reply") or result.get("message")}
+
+
+def _cancelled_workflow_response(intent: str) -> dict:
+    if intent == WORKFLOW_CREATE_TASK or intent == CREATE_TASK:
+        reply = "No problem. I've cancelled the task creation. Nothing was added."
+        cancelled_intent = CREATE_TASK
+    elif intent == WORKFLOW_DELETE_TASK or intent == DELETE_TASK:
+        reply = "No problem. I've cancelled the deletion. Nothing was deleted."
+        cancelled_intent = DELETE_TASK
+    else:
+        reply = "No problem. I've cancelled that update. Nothing was changed."
+        cancelled_intent = UPDATE_TASK
+    return {
+        "status": "cancelled",
+        "intent": cancelled_intent,
+        "message": reply,
+        "reply": reply,
+        "stage": "start",
+        "draft": None,
+        "workflow_status": WORKFLOW_STATUS_CANCELLED,
+    }
+
+
+def _post_followup_state(memory: dict | None) -> dict:
+    context = (memory or {}).get("context") or {}
+    state = context.get("post_execution_followup") or {}
+    if not isinstance(state, dict):
+        return {"eligible": False, "asked": False, "answered": False}
+    return {
+        "eligible": bool(state.get("eligible")),
+        "asked": bool(state.get("asked")),
+        "answered": bool(state.get("answered")),
+        "operation_intent": state.get("operation_intent"),
+        "task_id": state.get("task_id"),
+    }
+
+
+def _notification_context_for_employee(employee_id: int | None, notification_id: int | None = None) -> dict | None:
+    if not employee_id:
+        return None
+    session = SessionLocal()
+    try:
+        from database.models import Notification, Task
+        q = session.query(Notification).filter(Notification.employee_id == int(employee_id))
+        if notification_id:
+            q = q.filter(Notification.id == int(notification_id))
+        else:
+            q = q.filter(
+                Notification.notification_type.in_(
+                    [missing_field_followup.TYPE_TASK_MISSING_DETAILS, "TASK_ASSIGNED"]
+                )
+            )
+        rows = q.order_by(Notification.is_read.asc(), Notification.created_at.desc(), Notification.id.desc()).limit(10).all()
+        for row in rows:
+            payload = dict(row.payload or {})
+            is_followup = (
+                row.notification_type == missing_field_followup.TYPE_TASK_MISSING_DETAILS
+                or payload.get("kind") in {"task_missing_details_followup", "task_assignment"}
+                or bool(payload.get("has_missing_fields"))
+            )
+            if not is_followup:
+                continue
+            state = str(payload.get("followup_status") or "pending").lower()
+            if notification_id is None and state in {missing_field_followup.STATUS_DISMISSED, missing_field_followup.STATUS_COMPLETED}:
+                continue
+            task = session.query(Task).filter(Task.id == int(row.task_id)).first()
+            if task is None or int(getattr(task, "assigned_to_employee_id", 0) or 0) != int(employee_id):
+                continue
+            missing = missing_field_followup.detect_missing_fields(task)
+            if not missing and state != missing_field_followup.STATUS_COMPLETED:
+                payload["followup_status"] = missing_field_followup.STATUS_COMPLETED
+                payload["missing_fields"] = missing
+                payload["has_missing_fields"] = False
+                row.payload = payload
+                session.add(row)
+                session.commit()
+            return {
+                "notification_id": int(row.id),
+                "task_id": int(row.task_id),
+                "meeting_id": payload.get("meeting_id"),
+                "action_item_id": payload.get("action_item_id"),
+                "followup_status": payload.get("followup_status") or "pending",
+                "missing_fields": missing,
+                "missing_field_labels": missing_field_followup.missing_field_labels(missing),
+                "task_title": getattr(task, "task_title", None),
+                "task_description": getattr(task, "task_description", None),
+                "assignee_name": getattr(task, "assigned_to", None),
+                "created_by_employee_id": payload.get("created_by_employee_id"),
+                "created_by_name": payload.get("created_by_name"),
+                "context_source": payload.get("context_source") or "task_assignment_notification",
+            }
+        return None
+    finally:
+        session.close()
+
+
+
+def _handle_notification_followup_message(
+    message: str,
+    *,
+    nctx: dict,
+    employee: str | None,
+    user_id: str | None,
+    conversation_id: str | None,
+) -> dict | None:
+    """Deterministic, safe handling for notification-context follow-ups.
+
+    Uses existing task_management services; never direct SQL, never cross-employee.
+    """
+    text = (message or "").strip()
+    if not text:
+        return None
+
+    task_id = int(nctx.get("task_id") or 0)
+    notification_id = int(nctx.get("notification_id") or 0)
+    if not task_id or not notification_id:
+        return None
+
+    actor = current_actor()
+    if actor is None:
+        return None
+
+    lower = _normalize_voice_text(text)
+
+    def _remember(result):
+        _remember_turn(
+            user_id=user_id,
+            employee=employee,
+            conversation_id=conversation_id,
+            user_message=text,
+            result=result,
+        )
+        return result
+
+    def _task_context_reply(task, *, prefix: str | None = None, include_prompt: bool = True) -> str:
+        title = getattr(task, "task_title", None) or nctx.get("task_title") or "this task"
+        desc = str(getattr(task, "task_description", None) or "").strip() or "Not specified"
+        assignee = (
+            getattr(task, "assigned_to", None)
+            or nctx.get("assignee_name")
+            or "Not specified"
+        )
+        assigning_manager = (
+            nctx.get("created_by_name")
+            or getattr(task, "created_by_name", None)
+            or "Not specified"
+        )
+        dd = getattr(task, "deadline_date", None)
+        dt = getattr(task, "deadline_time", None)
+        deadline = "Not specified"
+        if dd:
+            deadline = dd.strftime("%d %B %Y")
+            if dt:
+                deadline += f" at {dt.strftime('%I:%M %p').lstrip('0')}"
+        rd = getattr(task, "reminder_date", None)
+        rt = getattr(task, "reminder_time", None)
+        reminder = "Not specified"
+        if rd:
+            reminder = rd.strftime("%d %B %Y")
+            if rt:
+                reminder += f" at {rt.strftime('%I:%M %p').lstrip('0')}"
+        status = str(getattr(task, "status", None) or "PENDING").upper()
+        progress = getattr(task, "progress", 0)
+        progress = 0 if progress is None else int(progress)
+        missing = missing_field_followup.detect_missing_fields(task)
+        missing_text = (
+            ", ".join(missing_field_followup.missing_field_labels(missing))
+            if missing
+            else "None"
+        )
+        lines = []
+        if prefix:
+            lines.append(prefix)
+        lines.append(f"I've loaded your assigned task: {title}.")
+        lines.append("")
+        lines.append("Current details:")
+        lines.append(f"- Title: {title}")
+        lines.append(f"- Description: {desc}")
+        lines.append(f"- Assignee: {assignee}")
+        lines.append(f"- Assigning manager: {assigning_manager}")
+        lines.append(f"- Deadline: {deadline}")
+        lines.append(f"- Reminder: {reminder}")
+        lines.append(f"- Status: {status}")
+        lines.append(f"- Progress: {progress}%")
+        lines.append(f"- Missing: {missing_text}")
+        if include_prompt:
+            lines.append("")
+            lines.append("What would you like to update or add to this task?")
+        return "\n".join(lines)
+
+    # Accept / open existing-task follow-up context (never task creation)
+    if lower in {"yes", "yes please", "yes, complete", "complete it", "update missing details", "update it"} or "complete these details" in lower or "complete the missing task details" in lower:
+        missing_field_followup.mark_followup(notification_id, actor.id, missing_field_followup.STATUS_COLLECTING)
+        task = task_management.get_task_for_actor(task_id)
+        missing = missing_field_followup.detect_missing_fields(task)
+        reply = _task_context_reply(task)
+        return _remember({
+            "status": "clarification_required",
+            "intent": UPDATE_TASK,
+            "stage": "start",
+            "draft": None,
+            "message": reply,
+            "reply": reply,
+            "task": serialize_task(task),
+            "task_id": task_id,
+            "notification_context": {**nctx, "followup_status": "collecting", "missing_fields": missing, "missing_field_labels": missing_field_followup.missing_field_labels(missing)},
+        })
+
+    if lower in {"no", "not now", "skip", "skip for now", "no thanks", "dismiss"} or "don't want" in lower or "do not want" in lower:
+        missing_field_followup.mark_followup(notification_id, actor.id, missing_field_followup.STATUS_DISMISSED)
+        task = task_management.get_task_for_actor(task_id)
+        reply = "No problem. You can leave those details unspecified.\n\nWhat else would you like to do with this task?"
+        missing = missing_field_followup.detect_missing_fields(task)
+        return _remember({
+            "status": "clarification_required",
+            "intent": UPDATE_TASK,
+            "stage": "start",
+            "draft": None,
+            "message": reply,
+            "reply": reply,
+            "task": serialize_task(task),
+            "task_id": task_id,
+            "notification_context": {**nctx, "followup_status": "dismissed", "missing_fields": missing, "missing_field_labels": missing_field_followup.missing_field_labels(missing)},
+        })
+
+    # Show missing/details / task details
+    if any(p in lower for p in ["what is missing", "what details are missing", "missing details", "show me the details", "task details", "current details", "show details"]):
+        task = task_management.get_task_for_actor(task_id)
+        missing = missing_field_followup.detect_missing_fields(task)
+        reply = _task_context_reply(task, include_prompt=True)
+        return _remember({"status": "clarification_required", "intent": GET_TASK, "stage": "start", "draft": None, "message": reply, "reply": reply, "task": serialize_task(task), "task_id": task_id, "notification_context": {**nctx, "missing_fields": missing, "missing_field_labels": missing_field_followup.missing_field_labels(missing)}})
+
+    # User wants to complete missing details, but hasn't specified which one.
+    if "complete" in lower and "missing" in lower:
+        task = task_management.get_task_for_actor(task_id)
+        missing = missing_field_followup.detect_missing_fields(task)
+        labels = missing_field_followup.missing_field_labels(missing)
+        if labels:
+            reply = f"Which missing detail would you like to add first: {', '.join(labels)}?"
+        else:
+            reply = "This task has no missing details. What would you like to update or add?"
+        return _remember({"status": "clarification_required", "intent": UPDATE_TASK, "stage": "start", "draft": None, "message": reply, "reply": reply, "task": serialize_task(task), "task_id": task_id, "notification_context": {**nctx, "missing_fields": missing, "missing_field_labels": labels}})
+
+    # Parse simple update commands for this existing-task context.
+    updates = {}
+    # progress
+    m = re.search(r"\bprogress\b[^\d]{0,20}(\d{1,3})\s*%?", lower)
+    if not m and lower.startswith("set it to ") and re.search(r"\d{1,3}", lower):
+        m = re.search(r"(\d{1,3})", lower)
+        if "progress" not in (nctx.get("missing_fields") or []) and "%" not in lower:
+            m = None
+    if m:
+        updates["progress"] = max(0, min(100, int(m.group(1))))
+
+    # description
+    desc_prefixes = [
+        "set its description to ",
+        "set the description to ",
+        "change its description to ",
+        "update its description to ",
+        "description is ",
+        "add description ",
+    ]
+    for prefix in desc_prefixes:
+        if prefix in lower:
+            i = lower.find(prefix)
+            value = text[i + len(prefix):].strip().strip('"').strip("'").strip()
+            if value and value.lower() not in {"not specified", "none", "empty", "leave it empty"}:
+                updates["task_description"] = value
+            break
+
+    # deadline natural phrases
+    if "deadline" in lower or "due" in lower:
+        phrase = text
+        for prefix in ["set its deadline to", "set the deadline to", "change its deadline to", "deadline is", "set deadline to", "make it due on", "make it due"]:
+            if prefix in lower:
+                i = lower.find(prefix)
+                phrase = text[i + len(prefix):].strip(" .")
+                break
+        resolved = resolve(phrase, now=datetime.now(ZoneInfo(TIMEZONE)), timezone=TIMEZONE)
+        if resolved.resolved_date is not None:
+            updates["deadline_date"] = resolved.resolved_date
+        if resolved.resolved_time is not None:
+            updates["deadline_time"] = resolved.resolved_time
+
+    # reminder natural phrases
+    if "reminder" in lower:
+        phrase = text
+        for prefix in ["set its reminder to", "set the reminder to", "change its reminder to", "reminder is", "set reminder to", "remind me on", "remind me at"]:
+            if prefix in lower:
+                i = lower.find(prefix)
+                phrase = text[i + len(prefix):].strip(" .")
+                break
+        resolved = resolve(phrase, now=datetime.now(ZoneInfo(TIMEZONE)), timezone=TIMEZONE)
+        if resolved.resolved_date is not None:
+            updates["reminder_date"] = resolved.resolved_date
+        if resolved.resolved_time is not None:
+            updates["reminder_time"] = resolved.resolved_time
+
+    # status - only explicit status changes by assignee
+    if "mark this task as completed" in lower or lower == "completed" or "status to completed" in lower:
+        updates["status"] = "COMPLETED"
+        updates.setdefault("progress", 100)
+    elif "in progress" in lower and ("status" in lower or "mark" in lower):
+        updates["status"] = "IN_PROGRESS"
+    elif "status to pending" in lower:
+        updates["status"] = "PENDING"
+
+    if updates:
+        # Apply only to the notification task; task_management enforces auth/ownership.
+        try:
+            task = task_management.update_task(task_id, updates)
+        except task_management.TaskManagementError as e:
+            reply = str(e)
+            return _remember({"status": "error", "intent": UPDATE_TASK, "stage": "start", "draft": None, "message": reply, "reply": reply, "task_id": task_id, "notification_context": nctx})
+
+        missing = missing_field_followup.detect_missing_fields(task)
+        if not missing:
+            missing_field_followup.mark_followup(notification_id, actor.id, missing_field_followup.STATUS_COMPLETED)
+        else:
+            missing_field_followup.mark_followup(notification_id, actor.id, missing_field_followup.STATUS_COLLECTING)
+        title = getattr(task, "task_title", None) or "the task"
+        parts = []
+        if "deadline_date" in updates or "deadline_time" in updates:
+            dd = getattr(task, "deadline_date", None)
+            dt = getattr(task, "deadline_time", None)
+            if dd:
+                when = dd.strftime("%d %B %Y")
+                if dt:
+                    when += f" at {dt.strftime('%I:%M %p').lstrip('0')}"
+                parts.append(f"deadline to {when}")
+        if "reminder_date" in updates or "reminder_time" in updates:
+            rd = getattr(task, "reminder_date", None)
+            rt = getattr(task, "reminder_time", None)
+            if rd:
+                when = rd.strftime("%d %B %Y")
+                if rt:
+                    when += f" at {rt.strftime('%I:%M %p').lstrip('0')}"
+                parts.append(f"reminder to {when}")
+        if "task_description" in updates:
+            parts.append("description")
+        if "progress" in updates:
+            parts.append(f"progress to {getattr(task, 'progress', updates.get('progress'))}%")
+        if "status" in updates:
+            parts.append(f"status to {getattr(task, 'status', updates.get('status'))}")
+        if parts:
+            reply = f"Done! Updated {' and '.join(parts)} for {title}."
+        else:
+            reply = f"Done! Updated {title}."
+        if missing:
+            reply += f"\n\nStill missing: {', '.join(missing_field_followup.missing_field_labels(missing))}."
+        reply += "\n\nWhat else would you like to do with this task?"
+        return _remember({"status": "success", "intent": UPDATE_TASK, "stage": "start", "draft": None, "message": reply, "reply": reply, "task": serialize_task(task), "task_id": task_id, "notification_context": {**nctx, "followup_status": "completed" if not missing else "collecting", "missing_fields": missing, "missing_field_labels": missing_field_followup.missing_field_labels(missing)}})
+
+    # Explicitly create a NEW task: leave notification follow-up context to
+    # the normal task-creation flow. Do not hijack it as an existing-task update.
+    if is_explicit_create_request(text):
+        return None
+
+    # If user explicitly references a different task ID, let normal flow handle it.
+    other_task_ids = [int(m) for m in re.findall(r"\btask\s*#?(\d+)\b", lower)]
+    if any(tid != task_id for tid in other_task_ids):
+        return None
+
+    # For list/get/delete intents, let normal flow handle them.
+    if detect_intent(text, task_in_context=True).name in {LIST_TASKS, GET_TASK, DELETE_TASK}:
+        return None
+
+    # Default in existing-task notification context: keep context, no task creation.
+    task = task_management.get_task_for_actor(task_id)
+    missing = missing_field_followup.detect_missing_fields(task)
+    reply = _task_context_reply(task, include_prompt=True)
+    return _remember({"status": "clarification_required", "intent": UPDATE_TASK, "stage": "start", "draft": None, "message": reply, "reply": reply, "task": serialize_task(task), "task_id": task_id, "notification_context": {**nctx, "missing_fields": missing, "missing_field_labels": missing_field_followup.missing_field_labels(missing)}})
+
+def _is_post_followup_eligible(result: dict) -> bool:
+    result = result or {}
+    if result.get("status") != "success":
+        return False
+    intent = result.get("intent")
+    if intent not in (CREATE_TASK, UPDATE_TASK, DELETE_TASK, GET_TASK, LIST_TASKS):
+        return False
+    if result.get("stage") in CREATE_STAGES | UPDATE_STAGES:
+        return False
+    if intent in (UPDATE_TASK, DELETE_TASK) and not result.get("task") and not result.get("task_id"):
+        return False
+    return True
+
+
+def _post_followup_prompt(result: dict) -> str:
+    intent = (result or {}).get("intent")
+    task = (result or {}).get("task") or {}
+    title = (task.get("task_title") or "that task").strip() or "that task"
+    prompts = {
+        CREATE_TASK: [
+            f"'{title}' is all set. Anything else you'd like me to help with?",
+            f"Task '{title}' is created. Need help with anything else?",
+        ],
+        UPDATE_TASK: [
+            f"'{title}' is updated. What else can I do for you?",
+            f"Done updating '{title}'. Want me to change anything else?",
+        ],
+        DELETE_TASK: [
+            "The task is deleted. Anything else you'd like me to handle?",
+            "Done - that task has been removed. Need anything else?",
+        ],
+        GET_TASK: [
+            "Here are the task details. Would you like me to update or manage anything?",
+            "Anything else you'd like me to check or update?",
+        ],
+        LIST_TASKS: [
+            "Here are your tasks. Would you like me to update, review, or manage any of them?",
+            "Anything else you'd like me to do with these tasks?",
+        ],
+    }
+    options = prompts.get(intent) or ["Anything else I can help you with?"]
+    idx = int((result or {}).get("task_id") or (task.get("id") or 0) or 0) % len(options)
+    return options[idx]
 
 
 def _display_value(name: str, value) -> str:
@@ -2729,6 +3335,11 @@ def process_task(
 
     # 2. Continuation of the "change an existing task" conversation.
     if stage in UPDATE_STAGES:
+        if _is_explicit_cancellation(user_input):
+            action = (draft or {}).get("action") or "update"
+            intent_name = DELETE_TASK if stage == STAGE_CONFIRM_DELETE or action == "delete" else UPDATE_TASK
+            return _cancelled_workflow_response(intent_name)
+
         if intent.name == CREATE_TASK and not _looks_like_selection(
             user_input,
             (draft or {}).get("candidates") or [],
@@ -2741,11 +3352,18 @@ def process_task(
             return _start_create_flow(user_input)
 
         if stage == STAGE_SELECT_TASK and (draft or {}).get("action") == "read":
-            # A read found several candidates: the employee now names the one
-            # to show. The candidates come from the previous answer.
             selection = UPDATE_ENGINE.resolve_selection(draft, user_input)
 
             if selection is None:
+                # If it's not a selection, treat as a fresh operation only when explicit.
+                if is_explicit_create_request(user_input) or is_explicit_update_request(user_input) or intent.name in (DELETE_TASK, LIST_TASKS, GET_TASK):
+                    return process_task(
+                        user_input,
+                        task_id=task_id,
+                        stage="start",
+                        employee=employee,
+                        context_task_id=context_task_id,
+                    )
                 return _task_selection_response(
                     "I still need to know which task to read.",
                     (draft or {}).get("candidates") or [],
@@ -2757,6 +3375,14 @@ def process_task(
             return read_task(selection["task_id"], employee=employee)
 
         if stage == STAGE_CONFIRM_DELETE:
+            if is_explicit_create_request(user_input) or is_explicit_update_request(user_input) or intent.name == LIST_TASKS or intent.name == GET_TASK:
+                return process_task(
+                    user_input,
+                    task_id=task_id,
+                    stage="start",
+                    employee=employee,
+                    context_task_id=context_task_id,
+                )
             return process_delete(
                 user_input,
                 task_id=(draft or {}).get("task_id") or task_id,
@@ -2765,14 +3391,27 @@ def process_task(
                 draft=draft,
             )
 
-        if intent.name == DELETE_TASK:
-            # An explicit deletion is never swallowed by a pending update.
+        if intent.name == DELETE_TASK and stage != STAGE_CONFIRM_DELETE:
+            # Explicit deletion switches the workflow.
             return process_delete(
                 user_input,
                 task_id=task_id,
                 employee=employee,
                 confirm_delete=confirm_delete,
-                draft=draft,
+                draft=None,
+            )
+
+        if intent.name in (GET_TASK, LIST_TASKS) and not _looks_like_selection(
+            user_input,
+            (draft or {}).get("candidates") or [],
+            (draft or {}).get("action") or "update",
+        ):
+            return process_task(
+                user_input,
+                task_id=task_id,
+                stage="start",
+                employee=employee,
+                context_task_id=context_task_id,
             )
 
         return process_update(
@@ -2852,6 +3491,7 @@ def process_chat_turn(
     employee: str | None = None,
     conversation_id: str | None = None,
     user_id: str | None = None,
+    notification_id: int | None = None,
 ):
     """Handle one turn of the live chat conversation.
 
@@ -2868,7 +3508,77 @@ def process_chat_turn(
     """
 
     transcript = (user_input or "").strip()
+    actor = current_actor()
+    explicit_notification_entry = notification_id is not None
+    nctx = _notification_context_for_employee(getattr(actor, "id", None), notification_id)
     memory = _load_memory(user_id, employee, conversation_id)
+
+    # Persist notification context in conversation memory for refresh/restart continuity.
+    if nctx and (conversation_id or "").strip() and (user_id or employee or getattr(actor, "id", None)):
+        try:
+            identity = _memory_identity(user_id, employee)
+            save_conversation_memory(
+                identity,
+                (conversation_id or "").strip(),
+                context={
+                    "notification_followup": nctx,
+                    "active_task": {"id": nctx.get("task_id"), "task_title": nctx.get("task_title")},
+                },
+            )
+        except Exception:
+            logger.warning("Could not persist notification context in memory.", exc_info=True)
+
+    if not nctx:
+        nctx = ((memory or {}).get("context") or {}).get("notification_followup") or None
+
+    # An explicit notification click/open is an existing-task context. Do not
+    # let stale task-creation draft/stage leak into it, but preserve legitimate
+    # update/delete confirmation stages.
+    if nctx and explicit_notification_entry and stage in CREATE_STAGES:
+        logger.info(
+            "notification_followup_clear_stale_create notification_id=%s task_id=%s actor_id=%s stale_stage=%s",
+            nctx.get("notification_id"),
+            nctx.get("task_id"),
+            getattr(actor, "id", None),
+            stage,
+        )
+        stage = "start"
+        draft = None
+        answers = None
+        reminder_text = None
+        confirm = False
+        confirm_delete = False
+
+    # Notification follow-up context: try deterministic handler first.
+    # It keeps existing-task context, handles Yes/No/simple updates, and
+    # returns None for explicit new-task or unrelated task-management requests.
+    if nctx and stage in FRESH_STAGES:
+        logger.info(
+            "notification_followup_turn notification_id=%s task_id=%s actor_id=%s conversation_id=%s stage=%s",
+            nctx.get("notification_id"),
+            nctx.get("task_id"),
+            getattr(actor, "id", None),
+            conversation_id,
+            stage,
+        )
+        quick = _handle_notification_followup_message(
+            transcript,
+            nctx=nctx,
+            employee=employee,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        if quick is not None:
+            logger.info(
+                "notification_followup_handled notification_id=%s task_id=%s intent=%s status=%s",
+                nctx.get("notification_id"),
+                nctx.get("task_id"),
+                quick.get("intent"),
+                quick.get("status"),
+            )
+            quick.setdefault("notification_context", nctx)
+            return quick
+
     resume_creation = stage in FRESH_STAGES and _should_resume_creation(
         transcript, memory
     )
@@ -2892,12 +3602,80 @@ def process_chat_turn(
             employee=employee,
             user_id=user_id,
             conversation_id=conversation_id,
+            notification_context=nctx,
         )
 
         if agent_result is not None:
+            if nctx and isinstance(agent_result, dict):
+                agent_result.setdefault("notification_context", nctx)
             return agent_result
 
-    return _with_memory(
+    # Post-execution follow-up: handle only when no active staged workflow.
+    if stage in FRESH_STAGES and not resume_creation and not creation_turn:
+        followup = _post_followup_state(memory)
+        if followup.get("eligible") and followup.get("asked") and not followup.get("answered"):
+            identity = _memory_identity(user_id, employee)
+            conversation = (conversation_id or "").strip()
+            if _is_explicit_cancellation(transcript):
+                if identity and conversation:
+                    try:
+                        append_history(identity, conversation, [{"role": "user", "text": transcript}, {"role": "assistant", "text": "No problem. Nothing else is in progress."}])
+                        save_conversation_memory(identity, conversation, context={"post_execution_followup": {"eligible": False, "asked": True, "answered": True}, "pending": {}, "candidates": [], "clarification": {}, "task_creation": {}})
+                    except Exception:
+                        logger.warning("Could not store follow-up cancellation state.")
+                return {"status": "success", "intent": GENERAL_QUERY, "message": "No problem. Nothing else is in progress.", "reply": "No problem. Nothing else is in progress."}
+            if _post_followup_negative(transcript):
+                if identity and conversation:
+                    try:
+                        append_history(identity, conversation, [{"role": "user", "text": transcript}, {"role": "assistant", "text": "Alright! Let me know whenever you need anything."}])
+                        save_conversation_memory(identity, conversation, context={"post_execution_followup": {"eligible": False, "asked": True, "answered": True}, "pending": {}, "candidates": [], "clarification": {}, "task_creation": {}})
+                    except Exception:
+                        logger.warning("Could not store follow-up closure state.")
+                return {"status": "success", "intent": GENERAL_QUERY, "message": "Alright! Let me know whenever you need anything.", "reply": "Alright! Let me know whenever you need anything."}
+            if _post_followup_positive(transcript):
+                if identity and conversation:
+                    try:
+                        append_history(identity, conversation, [{"role": "user", "text": transcript}, {"role": "assistant", "text": "Sure - what would you like me to help you with?"}])
+                        save_conversation_memory(identity, conversation, context={"post_execution_followup": {"eligible": False, "asked": True, "answered": True}, "pending": {}, "candidates": [], "clarification": {}, "task_creation": {}})
+                    except Exception:
+                        logger.warning("Could not store follow-up state.")
+                return {"status": "clarification_required", "intent": CLARIFICATION_REQUIRED, "message": "Sure - what would you like me to help you with?", "reply": "Sure - what would you like me to help you with?"}
+            if _post_followup_new_request(transcript):
+                if identity and conversation:
+                    try:
+                        save_conversation_memory(identity, conversation, context={"post_execution_followup": {}})
+                    except Exception:
+                        pass
+                # fall through to normal routing with cleared follow-up state
+            else:
+                # not clearly related; treat as normal new request, clear follow-up
+                if identity and conversation:
+                    try:
+                        save_conversation_memory(identity, conversation, context={"post_execution_followup": {}})
+                    except Exception:
+                        pass
+
+    # Agent path (if enabled) should receive explicit notification context.
+    if (
+        stage in FRESH_STAGES
+        and _database_agent_enabled()
+        and not resume_creation
+        and not creation_turn
+    ):
+        agent_result = _run_database_agent_turn(
+            transcript,
+            employee=employee,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            notification_context=nctx,
+        )
+
+        if agent_result is not None:
+            if nctx and isinstance(agent_result, dict):
+                agent_result.setdefault("notification_context", nctx)
+            return agent_result
+
+    result = _with_memory(
         transcript,
         conversation_id=conversation_id,
         user_id=user_id,
@@ -2920,6 +3698,25 @@ def process_chat_turn(
             context_task_id=restored_task_id,
         ),
     )
+
+    if _is_post_followup_eligible(result):
+        asked = bool((_post_followup_state(memory) or {}).get("asked")) or bool((result.get("followup") or {}).get("asked"))
+        if not asked:
+            prompt = _post_followup_prompt(result)
+            reply = (result.get("reply") or result.get("message") or "").rstrip()
+            result["reply"] = f"{reply}\n\n{prompt}" if reply else prompt
+            result["message"] = result["reply"]
+            result["followup"] = {"asked": True, "type": "post_execution"}
+            identity = _memory_identity(user_id, employee)
+            conversation = (conversation_id or "").strip()
+            if identity and conversation:
+                try:
+                    save_conversation_memory(identity, conversation, context={"post_execution_followup": {"eligible": True, "asked": True, "answered": False, "operation_intent": result.get("intent"), "task_id": (result.get("task") or {}).get("id") or result.get("task_id")}})
+                except Exception:
+                    logger.warning("Could not store post-execution follow-up state.")
+    if nctx and isinstance(result, dict):
+        result.setdefault("notification_context", nctx)
+    return result
 
 
 def _run_chat_turn(
@@ -2972,10 +3769,39 @@ def _run_chat_turn(
             context_task_id=context_task_id,
         )
 
+    if stage in CREATE_STAGES and _is_explicit_cancellation(transcript):
+        return _cancelled_workflow_response(CREATE_TASK)
+
+    if stage in CREATE_STAGES and _is_backtrack_request(transcript):
+        # Minimal safe backtrack: re-ask current stage question without losing draft.
+        engine = TaskDraftEngine(extractor)
+        if stage == STAGE_CONFIRM_REMINDER:
+            return {"status":"clarification_required","intent":CREATE_TASK,"stage":STAGE_REMINDER,"draft":draft,"message":"Okay, let's go back. Would you like to set a reminder for this task?","reply":"Okay, let's go back. Would you like to set a reminder for this task?"}
+        if stage in (STAGE_REMINDER, STAGE_CONFIRM_FIELDS):
+            missing = [n for n in required_task_fields() if (draft or {}).get(n) in (None, "")]
+            if missing:
+                q = engine._question_for_field(missing[0])
+                return {"status":"clarification_required","intent":CREATE_TASK,"stage":STAGE_FIELDS,"draft":draft,"missing_fields":missing,"message":"Okay, let's go back. "+q,"reply":"Okay, let's go back. "+q}
+            summary = engine._confirm_fields_summary(draft)
+            return {"status":"confirmation_required","intent":CREATE_TASK,"stage":STAGE_CONFIRM_FIELDS,"draft":draft,"message":"Okay, let's go back. "+summary,"reply":"Okay, let's go back. "+summary}
+        missing = [n for n in required_task_fields() if (draft or {}).get(n) in (None, "")]
+        q = engine._question_for_field(missing[0]) if missing else "What would you like to change?"
+        return {"status":"clarification_required","intent":CREATE_TASK,"stage":STAGE_FIELDS,"draft":draft,"missing_fields":missing,"message":"Okay, let's go back. "+q,"reply":"Okay, let's go back. "+q}
+
     if stage in CREATE_STAGES and is_explicit_update_request(transcript):
         # The employee asks to change an existing task in the middle of a
         # creation conversation: the new task draft is left behind, and no
         # new-task extraction is run for an explicit update request.
+        return process_task(
+            transcript,
+            task_id=task_id,
+            stage="start",
+            employee=employee,
+            context_task_id=context_task_id,
+        )
+
+    if stage in CREATE_STAGES and detect_intent(transcript).name in (DELETE_TASK, LIST_TASKS, GET_TASK):
+        # Explicit intent switch from create to another workflow.
         return process_task(
             transcript,
             task_id=task_id,
@@ -2998,9 +3824,17 @@ def _run_chat_turn(
 
     try:
         if stage == STAGE_FIELDS:
+            if _is_explicit_cancellation(transcript):
+                return _cancelled_workflow_response(CREATE_TASK)
+            if _is_backtrack_request(transcript):
+                missing = [n for n in required_task_fields() if (draft or {}).get(n) in (None, "")]
+                q = engine._question_for_field(missing[0]) if missing else "What would you like to change?"
+                return {"status":"clarification_required","intent":CREATE_TASK,"stage":STAGE_FIELDS,"draft":draft,"missing_fields":missing,"message":"Okay, let's go back. "+q,"reply":"Okay, let's go back. "+q}
             result = engine.answer(draft, transcript)
 
         elif stage == STAGE_CONFIRM_FIELDS:
+            if _is_explicit_cancellation(transcript):
+                return _cancelled_workflow_response(CREATE_TASK)
             if answers:
                 result = engine.apply(draft, answers)
             elif confirm or _is_affirmation(transcript):
@@ -3010,6 +3844,7 @@ def _run_chat_turn(
                     "status": "confirmation_required",
                     "stage": STAGE_CONFIRM_FIELDS,
                     "draft": draft,
+                    "intent": CREATE_TASK,
                     "message": (
                         "Okay. Tell me which field to change and its new "
                         "value, for example 'progress is 80 percent'."
@@ -3023,11 +3858,15 @@ def _run_chat_turn(
                 result = engine.edit(draft, transcript)
 
         elif stage == STAGE_REMINDER:
+            if _is_explicit_cancellation(transcript):
+                return _cancelled_workflow_response(CREATE_TASK)
             result = engine.set_reminder(
                 draft, reminder_text or transcript
             )
 
         elif stage == STAGE_CONFIRM_REMINDER:
+            if _is_explicit_cancellation(transcript):
+                return _cancelled_workflow_response(CREATE_TASK)
             if reminder_is_declined(transcript):
                 result = engine.skip_reminder(draft)
             elif confirm or _is_affirmation(transcript):

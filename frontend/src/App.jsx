@@ -293,10 +293,12 @@ function App() {
   const [alertStatus, setAlertStatus] = useState("");
   const serviceWorkerRef = useRef(null);
   const alertControllerRef = useRef(null);
+  const notificationMenuRef = useRef(null);
   const seenNotificationIdsRef = useRef(new Set());
   const notificationsLoadedRef = useRef(false);
   const deepLinkOpenedRef = useRef(false);
   const testAlertSeqRef = useRef(0);
+  const activeNotificationIdRef = useRef(null);
 
   const [employees, setEmployees] = useState([]);
   const [employeeSummary, setEmployeeSummary] = useState({
@@ -859,11 +861,74 @@ function App() {
     }
   }, [apiFetch]);
 
+  const respondToNotification = async (notification, action) => {
+    setNotificationActionId(notification.id);
+    try {
+      const response = await apiFetch(`${NOTIFICATIONS_API}/${notification.id}/followup/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || "Unable to update notification.");
+      setNotifications((current) =>
+        current.map((item) =>
+          item.id === notification.id
+            ? { ...item, is_read: true, payload: { ...(item.payload || {}), followup_status: data.followup_status } }
+            : item
+        )
+      );
+      setUnreadCount((c) => Math.max(0, c - (notification.is_read ? 0 : 1)));
+      if (action === "accept") {
+        activeNotificationIdRef.current = notification.id;
+        setNotificationsOpen(false);
+        setActiveTab("assistant");
+        // Clear stale task-creation state; notification follow-up is an
+        // existing-task workflow and must never inherit a CREATE draft.
+        setStage(null);
+        setDraft(null);
+        setMissingFields([]);
+        setRequiredFields(DEFAULT_REQUIRED_FIELDS);
+        setSavedTask(null);
+        setSavedMessage("");
+        setStatus(null);
+        // Establish task context through existing chat flow.
+        submitMessage("Yes, I want to complete the missing task details.", {
+          notification_id: notification.id,
+          stage: null,
+          draft: null,
+        });
+      }
+      return data;
+    } catch (err) {
+      setNotificationsError(err.message);
+      return null;
+    } finally {
+      setNotificationActionId(null);
+    }
+  };
+
   const openNotification = async (notification) => {
     if (!notification.is_read) {
       await markNotificationRead(notification.id);
     }
-
+    const payload = notification.payload || {};
+    const isFollowup =
+      notification.notification_type === "TASK_MISSING_DETAILS" ||
+      payload.kind === "task_missing_details_followup" ||
+      payload.kind === "task_assignment";
+    const hasActions = Array.isArray(payload.actions) && payload.actions.length > 0;
+    if (isFollowup && hasActions) {
+      // Actionable notification: don't auto-open; buttons handle it.
+      return;
+    }
+    if (isFollowup) {
+      activeNotificationIdRef.current = notification.id;
+      setActiveTab("assistant");
+      setNotificationsOpen(false);
+      submitMessage("I received a task follow-up notification. What details are missing?");
+      return;
+    }
     openTaskFromNotification(notification.task_id);
   };
 
@@ -889,6 +954,44 @@ function App() {
     }
   };
 
+  const deleteNotification = async (notificationId) => {
+    setNotificationActionId(`delete-${notificationId}`);
+    try {
+      const response = await apiFetch(`${NOTIFICATIONS_API}/${notificationId}`, {
+        method: "DELETE",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.detail || "Unable to delete notification.");
+      }
+      setNotifications((current) => current.filter((item) => item.id !== notificationId));
+      setUnreadCount(Number(data.unread_count) || 0);
+    } catch (err) {
+      setNotificationsError(err.message);
+    } finally {
+      setNotificationActionId(null);
+    }
+  };
+
+  const deleteAllNotifications = async () => {
+    if (notifications.length === 0) return;
+    if (!window.confirm("Delete all notifications?")) return;
+    setNotificationActionId("delete-all");
+    try {
+      const response = await apiFetch(NOTIFICATIONS_API, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.detail || "Unable to delete notifications.");
+      }
+      setNotifications([]);
+      setUnreadCount(0);
+    } catch (err) {
+      setNotificationsError(err.message);
+    } finally {
+      setNotificationActionId(null);
+    }
+  };
+
   const toggleNotifications = () => {
     setNotificationsOpen((open) => {
       const next = !open;
@@ -896,6 +999,26 @@ function App() {
       return next;
     });
   };
+
+  useEffect(() => {
+    if (!notificationsOpen) return undefined;
+    const handlePointerDown = (event) => {
+      if (notificationMenuRef.current && !notificationMenuRef.current.contains(event.target)) {
+        setNotificationsOpen(false);
+      }
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") setNotificationsOpen(false);
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("touchstart", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("touchstart", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [notificationsOpen]);
 
   const saveNotificationTimezone = async (event) => {
     event.preventDefault();
@@ -1106,17 +1229,24 @@ function App() {
 
     deepLinkOpenedRef.current = true;
     const notificationId = notificationIdFromSearch(window.location.search);
+    const isFollowup = new URLSearchParams(window.location.search).get('followup') === '1';
     const timer = window.setTimeout(() => {
       if (notificationId) {
         markNotificationRead(notificationId);
       }
-
+      if (notificationId && isFollowup) {
+        activeNotificationIdRef.current = notificationId;
+        setActiveTab('assistant');
+        submitMessage('I opened a task follow-up notification. What details are missing?');
+        return;
+      }
       openTaskFromNotification(taskId);
     }, 0);
 
     const url = new URL(window.location.href);
     url.searchParams.delete("task");
     url.searchParams.delete("notification");
+    url.searchParams.delete("followup");
     window.history.replaceState(
       {},
       "",
@@ -1500,6 +1630,11 @@ function App() {
       setSavedTask(null);
     }
 
+    // Persist trusted notification context from backend when present.
+    if (data.notification_context?.notification_id) {
+      activeNotificationIdRef.current = data.notification_context.notification_id;
+    }
+
     addMessage("assistant", reply);
 
     if (shouldSpeak) {
@@ -1507,23 +1642,34 @@ function App() {
     }
   };
 
-  const submitMessage = async (message) => {
+  const submitMessage = async (message, options = {}) => {
     if (!message || loading) return;
+    const notificationId =
+      options.notification_id ?? activeNotificationIdRef.current ?? undefined;
+    const requestStage = options.stage !== undefined ? options.stage : stage;
+    const requestDraft = options.draft !== undefined ? options.draft : draft;
 
     addMessage("user", message);
     setLoading(true);
     setError("");
 
     try {
+      const payload = {
+        message,
+        stage: requestStage,
+        draft: requestDraft,
+        conversation_id: conversationId,
+        notification_id: notificationId,
+      };
+      console.info("chat_request", {
+        notification_id: notificationId,
+        stage: requestStage,
+        has_draft: !!requestDraft,
+      });
       const response = await apiFetch(CHAT_API, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message,
-          stage,
-          draft,
-          conversation_id: conversationId,
-        }),
+        body: JSON.stringify(payload),
       });
 
       const data = await response.json();
@@ -1532,6 +1678,13 @@ function App() {
         throw new Error(data.detail || "Chat processing failed.");
       }
 
+      console.info("chat_response", {
+        notification_id: notificationId,
+        status: data.status,
+        intent: data.intent,
+        stage: data.stage,
+        has_notification_context: !!data.notification_context,
+      });
       applyConversation(data);
     } catch (err) {
       setError(err.message);
@@ -1582,6 +1735,10 @@ function App() {
     const message = input.trim();
     if (!message || loading) return;
 
+    // If user explicitly starts a new task, clear notification follow-up anchor.
+    if (/^\s*(create|add|make)\s+(a\s+)?(new\s+)?task\b/i.test(message)) {
+      activeNotificationIdRef.current = null;
+    }
     setInput("");
     submitMessage(message);
   };
@@ -1617,6 +1774,7 @@ function App() {
     setError("");
     setAudio(null);
     setAudioUrl("");
+    activeNotificationIdRef.current = null;
     // A new conversation starts with a new id, so the memory of the older
     // conversation (the active task) is not reused.
     setConversationId(newConversationId());
@@ -2523,7 +2681,7 @@ function App() {
         </div>
 
         <div className="header-actions">
-          <div className="notification-menu">
+          <div className="notification-menu" ref={notificationMenuRef}>
             <button
               type="button"
               className={`notification-bell ${
@@ -2548,18 +2706,24 @@ function App() {
                     <p className="eyebrow">Reminders</p>
                     <h2>Notifications</h2>
                   </div>
-                  <button
-                    type="button"
-                    className="notification-mark-all"
-                    onClick={markAllNotificationsRead}
-                    disabled={
-                      unreadCount === 0 || notificationActionId === "all"
-                    }
-                  >
-                    {notificationActionId === "all"
-                      ? "Saving…"
-                      : "Mark all read"}
-                  </button>
+                  <div className="notification-head-actions">
+                    <button
+                      type="button"
+                      className="notification-mark-all"
+                      onClick={markAllNotificationsRead}
+                      disabled={unreadCount === 0 || notificationActionId === "all"}
+                    >
+                      {notificationActionId === "all" ? "Saving…" : "Mark all read"}
+                    </button>
+                    <button
+                      type="button"
+                      className="notification-mark-all danger"
+                      onClick={deleteAllNotifications}
+                      disabled={notifications.length === 0 || notificationActionId === "delete-all"}
+                    >
+                      {notificationActionId === "delete-all" ? "Deleting…" : "Delete all"}
+                    </button>
+                  </div>
                 </div>
 
                 {notificationsError && (
@@ -2579,56 +2743,97 @@ function App() {
                       </span>
                     </div>
                   ) : (
-                    notifications.map((item) => (
-                      <article
-                        key={item.id}
-                        className={`notification-item ${
-                          item.is_read ? "" : "unread"
-                        }`}
-                      >
-                        <button
-                          type="button"
-                          className="notification-open"
-                          onClick={() => openNotification(item)}
-                          disabled={notificationActionId === item.id}
+                    notifications.map((item) => {
+                      const payload = item.payload || {};
+                      const actionable =
+                        payload.has_missing_fields &&
+                        (Array.isArray(payload.actions) ? payload.actions.length > 0 : true) &&
+                        !["collecting", "completed", "dismissed"].includes(
+                          String(payload.followup_status || "pending").toLowerCase()
+                        );
+                      return (
+                        <article
+                          key={item.id}
+                          className={`notification-item ${item.is_read ? "" : "unread"}`}
                         >
-                          <span className="notification-dot" aria-hidden="true" />
-                          <span className="notification-copy">
-                            <strong>
-                              {item.title}
-                              {["HIGH", "CRITICAL"].includes(
-                                String(item.priority || "").toUpperCase()
-                              ) && (
-                                <span
-                                  className={`priority-badge ${String(item.priority).toLowerCase()}`}
-                                >
-                                  {item.priority}
-                                </span>
-                              )}
-                            </strong>
-                            <span>{item.message}</span>
-                            <small>
-                              {formatDateTime(item.created_at)}
-                              {item.delivery_status === "NO_SUBSCRIPTION" ||
-                              item.delivery_status === "FAILED" ||
-                              item.delivery_status === "PARTIAL"
-                                ? " · In-app only"
-                                : ""}
-                            </small>
-                          </span>
-                        </button>
-                        {!item.is_read && (
                           <button
                             type="button"
-                            className="notification-read"
-                            onClick={() => markNotificationRead(item.id)}
+                            className="notification-open"
+                            onClick={() => openNotification(item)}
                             disabled={notificationActionId === item.id}
                           >
-                            Mark read
+                            <span className="notification-dot" aria-hidden="true" />
+                            <span className="notification-copy">
+                              <strong>
+                                {item.title}
+                                {["HIGH", "CRITICAL"].includes(
+                                  String(item.priority || "").toUpperCase()
+                                ) && (
+                                  <span className={`priority-badge ${String(item.priority).toLowerCase()}`}>
+                                    {item.priority}
+                                  </span>
+                                )}
+                              </strong>
+                              <span className="notification-message">{item.message}</span>
+                              {Array.isArray(payload.missing_fields) && payload.missing_fields.length > 0 && (
+                                <span className="notification-missing">
+                                  Missing: {payload.missing_fields.map((f) => FIELD_META[f]?.label || f).join(", ")}
+                                </span>
+                              )}
+                              <small>
+                                {formatDateTime(item.created_at)}
+                                {item.delivery_status === "NO_SUBSCRIPTION" ||
+                                item.delivery_status === "FAILED" ||
+                                item.delivery_status === "PARTIAL"
+                                  ? " · In-app only"
+                                  : ""}
+                              </small>
+                            </span>
                           </button>
-                        )}
-                      </article>
-                    ))
+                          <div className="notification-actions">
+                            {actionable && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="notification-action primary"
+                                  onClick={() => respondToNotification(item, "accept")}
+                                  disabled={notificationActionId === item.id}
+                                >
+                                  Yes, complete details
+                                </button>
+                                <button
+                                  type="button"
+                                  className="notification-action"
+                                  onClick={() => respondToNotification(item, "dismiss")}
+                                  disabled={notificationActionId === item.id}
+                                >
+                                  No, not now
+                                </button>
+                              </>
+                            )}
+                            {!item.is_read && !actionable && (
+                              <button
+                                type="button"
+                                className="notification-read"
+                                onClick={() => markNotificationRead(item.id)}
+                                disabled={notificationActionId === item.id}
+                              >
+                                Mark read
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="notification-read danger"
+                              onClick={() => deleteNotification(item.id)}
+                              disabled={notificationActionId === `delete-${item.id}`}
+                              aria-label={`Delete notification ${item.id}`}
+                            >
+                              {notificationActionId === `delete-${item.id}` ? "Deleting…" : "Delete"}
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })
                   )}
                 </div>
 

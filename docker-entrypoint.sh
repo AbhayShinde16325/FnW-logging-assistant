@@ -16,8 +16,14 @@ if [ -n "${MCP_BOOTSTRAP_CREDENTIAL_FILE:-}" ] && [ -f "${MCP_BOOTSTRAP_CREDENTI
     export MCP_BOOTSTRAP_CREDENTIAL_FILE="${MCP_BOOTSTRAP_RUNTIME_FILE}"
 fi
 
-if [ "${RUN_MIGRATIONS:-1}" = "1" ]; then
+case "${RUN_MIGRATIONS:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    echo "RUN_MIGRATIONS enabled; running alembic upgrade head."
     gosu app alembic upgrade head
-fi
+    ;;
+  *)
+    echo "RUN_MIGRATIONS disabled; skipping Alembic migrations."
+    ;;
+esac
 
 exec gosu app "$@"

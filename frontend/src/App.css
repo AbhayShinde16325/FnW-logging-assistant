@@ -2147,6 +2147,7 @@
   letter-spacing: -0.02em;
 }
 
+.notification-head-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;}
 .notification-mark-all,
 .notification-setting-button,
 .notification-read,
@@ -2160,11 +2161,9 @@
   cursor: pointer;
   transition: 150ms ease;
 }
-
-.notification-mark-all {
-  padding: 7px 10px;
-  white-space: nowrap;
-}
+.notification-mark-all { padding: 7px 10px; white-space: nowrap; }
+.notification-mark-all.danger,.notification-read.danger{color:#ff8a8a;border-color:rgba(255,90,90,.35);}
+.notification-mark-all.danger:hover:not(:disabled),.notification-read.danger:hover:not(:disabled){background:rgba(255,90,90,.08);border-color:rgba(255,90,90,.55);color:#ffb0b0;}
 
 .notification-mark-all:hover:not(:disabled),
 .notification-setting-button:hover:not(:disabled),
@@ -2605,10 +2604,13 @@ body,
   .notification-panel-head,
   .notification-settings > summary,
   .notification-settings-body,
-  .notification-list {
-    padding-left: 13px;
-    padding-right: 13px;
-  }
+  .notification-list { padding-left: 13px; padding-right: 13px; }
+  .notification-panel-head { flex-direction: column; align-items: stretch; }
+  .notification-head-actions { width: 100%; justify-content: stretch; }
+  .notification-head-actions button { flex: 1; }
+  .notification-actions { padding-left: 13px; padding-right: 13px; }
+  .notification-action, .notification-actions .notification-read { flex: 1; }
+  .notification-copy strong, .notification-message, .notification-missing { overflow-wrap:anywhere; word-break:break-word; }
 
   .push-settings,
   .attention-head,
@@ -2649,6 +2651,16 @@ body,
     width: calc(100% - 16px);
     padding: 14px 0 28px;
   }
+  .notification-panel {
+    position: fixed;
+    top: 72px;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-height: calc(100dvh - 84px);
+    border-radius: 14px;
+  }
+  .notification-open { gap: 8px; padding: 12px 0; }
 
   .app.tasks-view,
   .app.employees-view {
@@ -2724,3 +2736,10 @@ body,
     width: auto;
   }
 }
+
+.notification-message { white-space: pre-wrap; }
+.notification-missing { color: #ffb36b; font-size: 12px; }
+.notification-actions { display: flex; gap: 8px; padding: 0 14px 12px 42px; flex-wrap: wrap; }
+.notification-action { border: 1px solid #3a3d45; background: #24272d; color: #e5e5e7; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+.notification-action.primary { background: rgba(255,98,70,0.16); border-color: rgba(255,98,70,0.45); color: #ff765d; }
+.notification-action:disabled { opacity: .6; cursor: not-allowed; }

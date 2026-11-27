@@ -37,6 +37,7 @@ from services.task_service import (
     read_task,
     serialize_task,
 )
+from services import missing_field_followup
 
 from services.conversation_memory import update_response_feedback
 from services.task_scope import TaskActor, use_task_actor
@@ -220,6 +221,8 @@ class ChatRequest(BaseModel):
     # identifies the stored conversation memory.
     conversation_id: str | None = None
     user_id: str | None = None
+    # Optional notification context (from notification click / deep link).
+    notification_id: int | None = None
 
 
 class TaskCreateRequest(BaseModel):
@@ -626,6 +629,41 @@ def handle_text(
 
 
 # CONVERSATIONAL CHAT ENDPOINT
+class NotificationFollowupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str
+
+
+@app.post("/notifications/{notification_id}/followup/respond")
+def respond_notification_followup(
+    notification_id: int,
+    request: NotificationFollowupRequest,
+    employee: AuthenticatedEmployee | None = Depends(require_permission(TASKS_READ)),
+):
+    actor = _task_actor(employee)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="Authentication is required.")
+    action = (request.action or "").strip().lower()
+    if action not in {"accept", "dismiss"}:
+        raise HTTPException(status_code=400, detail="Action must be accept or dismiss.")
+    row = missing_field_followup.respond_assignment_followup(
+        notification_id,
+        actor.id,
+        action,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    payload = dict(getattr(row, "payload", None) or {})
+    return {
+        "status": "success",
+        "notification_id": int(notification_id),
+        "followup_status": payload.get("followup_status"),
+        "task_id": int(row.task_id),
+        "notification_context": payload,
+    }
+
+
 @app.post("/tasks/chat")
 def handle_chat(
     request: ChatRequest,
@@ -650,6 +688,7 @@ def handle_chat(
                 employee=_employee_name(employee, request.employee),
                 conversation_id=request.conversation_id,
                 user_id=_memory_user_id(employee, request.user_id),
+                notification_id=request.notification_id,
             )
 
         logger.info("Chat conversation turn processed.")

@@ -181,6 +181,41 @@ def mark_all_notifications_read(
     }
 
 
+@router.delete("/notifications/{notification_id}")
+def delete_notification(
+    notification_id: int,
+    employee: AuthenticatedEmployee | None = Depends(
+        require_permission(TASKS_READ)
+    ),
+):
+    actor = _actor(employee)
+    if not notification_service.delete_notification(actor.id, notification_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The notification was not found.",
+        )
+    return {
+        "status": "success",
+        "notification_id": notification_id,
+        "unread_count": notification_service.unread_notification_count(actor.id),
+    }
+
+
+@router.delete("/notifications")
+def delete_all_notifications(
+    employee: AuthenticatedEmployee | None = Depends(
+        require_permission(TASKS_READ)
+    ),
+):
+    actor = _actor(employee)
+    deleted = notification_service.delete_all_notifications(actor.id)
+    return {
+        "status": "success",
+        "deleted": deleted,
+        "unread_count": 0,
+    }
+
+
 @router.get("/push/public-key")
 def public_vapid_key():
     key = push_service.vapid_public_key()

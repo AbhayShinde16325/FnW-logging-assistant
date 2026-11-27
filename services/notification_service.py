@@ -32,6 +32,7 @@ TYPE_DEADLINE_APPROACHING = "DEADLINE_APPROACHING"
 TYPE_TASK_OVERDUE = "TASK_OVERDUE"
 TYPE_TASK_ASSIGNED = "TASK_ASSIGNED"
 TYPE_TASK_COMPLETED = "TASK_COMPLETED"
+TYPE_TASK_MISSING_DETAILS = "TASK_MISSING_DETAILS"
 
 STATUS_PENDING = "PENDING"
 STATUS_PROCESSING = "PROCESSING"
@@ -375,6 +376,44 @@ def mark_all_notifications_read(employee_id: int) -> int:
         session.close()
 
 
+def delete_notification(employee_id: int, notification_id: int) -> bool:
+    session = SessionLocal()
+
+    try:
+        row = session.query(Notification).filter(
+            Notification.id == notification_id,
+            Notification.employee_id == employee_id,
+        ).first()
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def delete_all_notifications(employee_id: int) -> int:
+    session = SessionLocal()
+
+    try:
+        count = (
+            session.query(Notification)
+            .filter(Notification.employee_id == employee_id)
+            .delete(synchronize_session=False)
+        )
+        session.commit()
+        return int(count or 0)
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 # --- device subscriptions ---------------------------------------------------
 
 
@@ -565,10 +604,13 @@ def create_task_event_notification(
     priority: str = PRIORITY_NORMAL,
     voice_text: str | None = None,
     payload: dict | None = None,
+    idempotent: bool = True,
 ) -> Notification | None:
     """Create one employee-scoped task event notification.
 
-    Idempotent via the unique (employee, task, type, scheduled_at) key.
+    Idempotent by default via unique (employee, task, type, scheduled_at).
+    For assignment notifications, pass a deterministic scheduled_at and
+    idempotent=True to avoid duplicates on unrelated edits.
     """
 
     session = SessionLocal()
@@ -592,14 +634,15 @@ def create_task_event_notification(
             created_at=utcnow(),
         )
 
-        existing = session.query(Notification.id).filter(
-            Notification.employee_id == values["employee_id"],
-            Notification.task_id == values["task_id"],
-            Notification.notification_type == values["notification_type"],
-            Notification.scheduled_at == values["scheduled_at"],
-        ).first()
-        if existing is not None:
-            return None
+        if idempotent:
+            existing = session.query(Notification).filter(
+                Notification.employee_id == values["employee_id"],
+                Notification.task_id == values["task_id"],
+                Notification.notification_type == values["notification_type"],
+                Notification.scheduled_at == values["scheduled_at"],
+            ).first()
+            if existing is not None:
+                return existing
 
         row = Notification(**values)
         session.add(row)
@@ -609,6 +652,13 @@ def create_task_event_notification(
             return row
         except IntegrityError:
             session.rollback()
+            if idempotent:
+                return session.query(Notification).filter(
+                    Notification.employee_id == values["employee_id"],
+                    Notification.task_id == values["task_id"],
+                    Notification.notification_type == values["notification_type"],
+                    Notification.scheduled_at == values["scheduled_at"],
+                ).first()
             return None
     except Exception:
         session.rollback()

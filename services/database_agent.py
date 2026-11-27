@@ -231,6 +231,7 @@ class ToolContext:
     conversation_id: str | None = None
     confirmation: str | None = None
     memory: dict | None = None
+    notification_context: dict = field(default_factory=dict)
     max_rows: int = MAX_READ_ROWS
     timeout_ms: int = READ_TIMEOUT_MS
     read_executor: Any = None
@@ -1441,6 +1442,14 @@ def _system_prompt(ctx: ToolContext, model_tools: list | None = None) -> str:
     else:
         scope = "No employee scope was supplied; the request is not restricted."
 
+    notification_ctx = ctx.notification_context or {}
+    notification_line = "- notification follow-up context: none"
+    if notification_ctx:
+        notification_line = (
+            "- notification follow-up context: "
+            + json.dumps(_jsonable(notification_ctx), default=str)
+        )
+
     return f"""
 You are the task database agent of a task-management application. You are the
 reasoning engine: decide what the user wants, choose tools, inspect the real
@@ -1458,6 +1467,7 @@ Available tools: {", ".join(_tool_names(model_tools or [])) or "none"}.
 Conversation context:
 - active task snapshot: {json.dumps(_jsonable(active), default=str)}
 - displayed candidates: {json.dumps(_jsonable(candidates), default=str)}
+{notification_line}
 - recent agent trace: {json.dumps(_jsonable(trace[-MAX_TRACE_ENTRIES:]), default=str)}
 
 Rules:
@@ -1491,6 +1501,12 @@ Rules:
     language.
 12. Stop as soon as the answer is known. Do not call a tool when the context
     already contains the answer.
+13. If notification follow-up context is present, it is the authoritative
+    existing-task context for this conversation. The task already exists. Do
+    not start task creation, do not ask for a task title, and do not answer
+    as if the employee is creating a new task. Use the notification task_id as
+    the active task unless the employee explicitly asks to create a different
+    new task or work on a different task by explicit reference.
 
 Use the native tools. Return a final natural-language answer only when no
 further tool call is needed.
@@ -1571,6 +1587,7 @@ def run_database_agent(
     conversation_id: str | None = None,
     memory: dict | None = None,
     confirmation: str | None = None,
+    notification_context: dict | None = None,
     client: ToolCallingClient | None = None,
     read_executor=None,
     write_executor=None,
@@ -1597,6 +1614,7 @@ def run_database_agent(
         conversation_id=(conversation_id or "").strip() or None,
         confirmation=confirmation,
         memory=memory,
+        notification_context=notification_context or {},
         max_rows=_max_read_rows(),
         timeout_ms=_timeout_ms(),
         read_executor=read_executor,

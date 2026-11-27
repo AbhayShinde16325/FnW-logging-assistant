@@ -267,7 +267,7 @@ def test_chat_asks_one_field_at_a_time_and_updates_draft(client, staged_service)
     )
     final = response.json()
     assert final["status"] == "success"
-    assert final["reply"] == "Task created successfully."
+    assert final["reply"].startswith("Task created successfully.")
 
 
 def test_chat_syncs_pending_status_with_progress(client, staged_service):

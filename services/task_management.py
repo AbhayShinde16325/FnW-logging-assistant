@@ -221,14 +221,27 @@ def _validate_reminder_schedule(
 
 def _deadline_phrase(task) -> str:
     if not getattr(task, "deadline_date", None):
-        return ""
+        return "Not specified."
     text = task.deadline_date.strftime("%d %B %Y")
     if getattr(task, "deadline_time", None):
-        text += f" at {task.deadline_time.strftime('%H:%M')}"
+        text += f", {task.deadline_time.strftime('%I:%M %p').lstrip('0')}"
     return text
 
 
-def _notify_assignment(task, *, previous_assignee_id=None) -> None:
+def _assignment_notification_missing(task) -> list[str]:
+    missing: list[str] = []
+    if not str(getattr(task, "task_description", None) or "").strip():
+        missing.append("task_description")
+    if getattr(task, "deadline_date", None) is None and getattr(task, "deadline_time", None) is None:
+        missing.extend(["deadline_date", "deadline_time"])
+    elif getattr(task, "deadline_date", None) is None:
+        missing.append("deadline_date")
+    elif getattr(task, "deadline_time", None) is None:
+        missing.append("deadline_time")
+    return missing
+
+
+def _notify_assignment(task, *, previous_assignee_id=None, created_by_actor=None) -> None:
     assignee_id = getattr(task, "assigned_to_employee_id", None)
     if assignee_id is None:
         return
@@ -243,32 +256,84 @@ def _notify_assignment(task, *, previous_assignee_id=None) -> None:
         except (TypeError, ValueError):
             pass
 
+    actor = created_by_actor or current_actor()
+    creator_name = (
+        getattr(actor, "name", None)
+        or getattr(actor, "email", None)
+        or "A manager"
+    )
+    creator_id = getattr(actor, "id", None)
+
     title = getattr(task, "task_title", None) or f"Task #{getattr(task, 'id', '')}"
     assignee_name = (getattr(task, "assigned_to", None) or "").strip()
-    greeting = f"Hey {assignee_name.split()[0].title()}, " if assignee_name else "Hey, "
+    description = str(getattr(task, "task_description", None) or "").strip() or "Not specified."
     deadline = _deadline_phrase(task)
-    message = f"{greeting}you have been assigned task #{task.id}: {title}."
-    voice = f"{greeting}you have received a new task assignment. Your task is {title}."
-    if deadline:
-        message += f" Deadline: {deadline}."
-        voice += f" The deadline is {deadline}. Please review it."
+    progress = getattr(task, "progress", 0)
+    progress = 0 if progress is None else int(progress)
+    status = str(getattr(task, "status", None) or "PENDING").upper()
+    missing = _assignment_notification_missing(task)
 
+    message_lines = [
+        f"{creator_name} assigned you a new task.",
+        f"Task: {title}",
+        f"Description: {description}",
+        f"Deadline: {deadline}",
+        f"Progress: {progress}%",
+        f"Status: {status.replace('_', ' ').title()}",
+    ]
+    if missing:
+        labels = []
+        if "task_description" in missing:
+            labels.append("Task description has not been specified.")
+        if "deadline_date" in missing or "deadline_time" in missing:
+            labels.append("Deadline has not been specified.")
+        message_lines.append("Missing information: " + " ".join(labels))
+        message_lines.append("Would you like to complete the missing task details?")
+
+    voice = f"Hey {assignee_name.split()[0].title() if assignee_name else 'there'}, {creator_name} assigned you a new task: {title}."
+    if "deadline_date" in missing or "deadline_time" in missing:
+        voice += " The deadline has not been specified."
+
+    payload = {
+        "kind": "task_assignment",
+        "notification_kind": "assignment",
+        "task_id": int(task.id),
+        "task_title": title,
+        "task_description": getattr(task, "task_description", None),
+        "assigned_to_employee_id": assignee_id,
+        "assigned_to": assignee_name or None,
+        "created_by_employee_id": creator_id,
+        "created_by_name": creator_name,
+        "deadline_date": task.deadline_date.isoformat() if getattr(task, "deadline_date", None) else None,
+        "deadline_time": task.deadline_time.isoformat(timespec="minutes") if getattr(task, "deadline_time", None) else None,
+        "deadline": deadline,
+        "status": status,
+        "progress": progress,
+        "missing_fields": missing,
+        "has_missing_fields": bool(missing),
+        "followup_status": "pending" if missing else "completed",
+        "actions": ["accept", "dismiss"] if missing else [],
+        "context_source": "task_assignment_notification",
+    }
+
+    # Deterministic scheduled_at per assignee+task prevents duplicate assignment
+    # notifications for unrelated edits while still creating one per reassignment.
+    scheduled_at = notification_service.utcnow().replace(microsecond=0)
+    scheduled_at = scheduled_at.replace(second=0)
+    # Include assignee in payload and rely on unique key (employee,task,type,scheduled_at).
+    # Use task creation/update minute bucket for idempotency across retries.
     try:
         notification_service.create_task_event_notification(
             int(task.id),
             assignee_id,
             notification_service.TYPE_TASK_ASSIGNED,
-            title=f"New task assignment: {title}",
-            message=message,
-            scheduled_at=notification_service.utcnow(),
+            title=f"New task assigned: {title}",
+            message="\n".join(message_lines),
+            scheduled_at=scheduled_at,
             priority=notification_service.PRIORITY_HIGH,
             voice_text=voice,
-            payload={
-                "notification_kind": "assignment",
-                "task_title": title,
-                "deadline": deadline or None,
-                "employee_name": assignee_name or None,
-            },
+            payload=payload,
+            idempotent=True,
         )
     except Exception:
         logger.exception("Could not create assignment notification for task %s.", getattr(task, "id", None))
@@ -338,7 +403,7 @@ def create_task(values: dict):
     )
 
     task = repository_create_task(data)
-    _notify_assignment(task)
+    _notify_assignment(task, created_by_actor=actor)
     return task
 
 
@@ -418,7 +483,7 @@ def update_task(task_id: int, values: dict):
         raise TaskNotFoundError("The task was not found.")
 
     if "assigned_to_employee_id" in data or "assigned_to" in data:
-        _notify_assignment(updated, previous_assignee_id=previous_assignee_id)
+        _notify_assignment(updated, previous_assignee_id=previous_assignee_id, created_by_actor=actor)
 
     return updated
 

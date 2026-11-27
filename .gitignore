@@ -52,3 +52,5 @@ Thumbs.db
 /tunnel/bin/
 /root/.config/tunnel-client/fnw-mcp-credential
 /root/.config/tunnel-client/fnw-mcp-authorization
+/secrets/
+/vapid-generated.env
